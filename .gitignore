@@ -1,0 +1,21 @@
+node_modules/
+dist/
+dist-main/
+release/
+.npm-cache/
+.electron-cache/
+*.log
+test-results/
+
+# 本机配置、凭据、数据和编辑器文件
+.env
+.env.*
+!.env.example
+credentials.json
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.tmp
+.DS_Store
+Thumbs.db

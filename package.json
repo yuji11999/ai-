@@ -1,0 +1,100 @@
+{
+  "name": "qingtu",
+  "productName": "轻图",
+  "version": "0.1.0",
+  "private": true,
+  "description": "轻图 Windows 云端生图桌面工具",
+  "author": "轻图",
+  "main": "dist-main/main.cjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "dev:desktop": "node scripts/dev-desktop.mjs",
+    "build": "tsc --noEmit && vite build && node scripts/build-main.mjs",
+    "test": "node --import tsx --test tests/*.test.ts src/renderer/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "start": "electron .",
+    "pack:win": "node scripts/verify-win-deps.cjs && electron-builder --win zip --x64 --publish never"
+  },
+  "build": {
+    "appId": "com.qingtu.desktop",
+    "productName": "轻图",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "dist-main/**",
+      "package.json",
+      "!node_modules/@img/sharp-linux*/**",
+      "!node_modules/@img/sharp-libvips-linux*/**",
+      "!node_modules/sql.js/dist/*debug*",
+      "!node_modules/sql.js/dist/sql-asm*",
+      "!node_modules/sql.js/dist/sql-wasm-browser*",
+      "!node_modules/sql.js/dist/worker*",
+      "!node_modules/exceljs/dist/**"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/@img/**",
+      "node_modules/sharp/**",
+      "node_modules/sql.js/dist/*.wasm",
+      "dist-main/image-worker.cjs",
+      "node_modules/semver/**",
+      "node_modules/detect-libc/**"
+    ],
+    "win": {
+      "target": [
+        "zip"
+      ],
+      "artifactName": "QingTu-${version}-windows-${arch}-portable.${ext}",
+      "signAndEditExecutable": false
+    },
+    "npmRebuild": false,
+    "afterPack": "scripts/after-pack.cjs",
+    "compression": "maximum",
+    "extraFiles": [
+      {
+        "from": "README.zh-CN.md",
+        "to": "轻图使用说明.md"
+      },
+      {
+        "from": "VALIDATION.txt",
+        "to": "验证说明.txt"
+      }
+    ],
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ]
+  },
+  "dependencies": {
+    "exceljs": "4.4.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "sharp": "0.35.5",
+    "sql.js": "1.15.2",
+    "undici": "8.12.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/sql.js": "1.4.11",
+    "@vitejs/plugin-react": "6.1.2",
+    "electron": "45.1.0",
+    "electron-builder": "26.18.0",
+    "esbuild": "0.28.2",
+    "resedit": "3.1.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
+  },
+  "optionalDependencies": {
+    "@img/sharp-win32-x64": "0.35.5"
+  }
+}
