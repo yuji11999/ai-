@@ -158,16 +158,18 @@ function Sidebar({ page, setPage }: { page: Page; setPage: (page: Page) => void 
     { key: 'ad0' as const, title: '✦ 生图模型', description: '连接供应商，启用你的生图模型', tone: '' },
     { key: 'ad1' as const, title: '⚡ 供应商服务', description: '查看节点服务与额度信息', tone: 'ad--hot' },
     { key: 'ad2' as const, title: '📚 提示词使用指南', description: '了解参考图与提示词的使用方式', tone: 'ad--cool' },
-  ].filter(ad => Boolean(PRODUCT.links[ad.key]));
+  ];
   const activeSlide = ads.length ? slide % ads.length : 0;
+  const activeAd = ads[activeSlide];
+  const slides = <div className="ad-slides" style={{ transform: `translateX(-${activeSlide * 100}%)` }}>{ads.map((ad, index) => <div className={`ad ${ad.tone}`} key={ad.key} aria-hidden={index !== activeSlide}><div className="ad-t">{ad.title}</div><div className="ad-d">{ad.description}</div></div>)}</div>;
   useEffect(() => { if (hover || ads.length < 2) return; const timer = setInterval(() => setSlide(value => (value + 1) % ads.length), 5000); return () => clearInterval(timer); }, [hover, ads.length]);
   const navigation: [Page, string][] = [['gen', '生成'], ['batch', '批量生图'], ['providers', '供应商设置'], ['settings', '基础设置'], ['about', '关于']];
   return <aside className="sidebar"><nav className="nav" aria-label="主导航">
     {navigation.map(([id, label], index) => <React.Fragment key={id}>{(index === 0 || index === 2) && <div className="sec">{index === 0 ? '生成' : '系统'}</div>}<button className={`nav-item ${page === id ? 'on' : ''}`} aria-current={page === id ? 'page' : undefined} onClick={() => setPage(id)}><Icon name={id} />{label}</button></React.Fragment>)}
-  </nav>{ads.length > 0 && <div className="adbox" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
-    <button className="ad-main" disabled={!online} onClick={() => void request('openLink', { name: ads[activeSlide].key })}><div className="ad-slides" style={{ transform: `translateX(-${activeSlide * 100}%)` }}>{ads.map(ad => <div className={`ad ${ad.tone}`} key={ad.key}><div className="ad-t">{ad.title}</div><div className="ad-d">{ad.description}</div></div>)}</div><span className="ad-go">了解详情 →</span></button>
+  </nav><div className="adbox" role="region" aria-label="推广信息" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
+    {PRODUCT.links[activeAd.key] ? <button type="button" className="ad-main" disabled={!online} onClick={() => void request('openLink', { name: activeAd.key })}>{slides}<span className="ad-go">了解详情 →</span></button> : <div className="ad-main ad-main--static">{slides}</div>}
     {ads.length > 1 && <div className="ad-dots">{ads.map((_, i) => <button key={i} aria-label={`资讯 ${i + 1}`} className={activeSlide === i ? 'on' : ''} onClick={() => setSlide(i)} />)}</div>}
-  </div>}</aside>;
+  </div></aside>;
 }
 
 type Draft = Pick<Task, 'prompt' | 'params' | 'concurrency' | 'retry'>;

@@ -81,6 +81,7 @@ svg{display:block}
 .adbox{margin:auto 12px 12px;position:relative;overflow:hidden;border-radius:12px;
   border:1px solid var(--line);cursor:pointer;transition:.2s;background:var(--panel)}
 .adbox:hover{border-color:var(--line2)}
+.adbox,.ad-main.ad-main--static{cursor:default}
 .adbox .ad-slides{display:flex;transition:transform .45s ease}
 .adbox .ad{padding:13px 14px;min-width:100%;background:linear-gradient(160deg,rgba(91,124,250,.16),rgba(139,92,246,.07))}
 .adbox .ad.ad--hot{background:linear-gradient(160deg,rgba(255,122,69,.16),rgba(245,165,36,.08))}
