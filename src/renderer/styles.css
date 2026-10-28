@@ -77,20 +77,12 @@ svg{display:block}
   box-shadow:0 3px 12px rgba(91,124,250,.35)}
 .btn-buy:hover{filter:brightness(1.12)}
 
-/* ---------- 侧栏购买推广 ---------- */
-.promotion-card{margin:auto 12px 12px;padding:14px;flex:none;border-radius:12px;
-  border:1px solid rgba(116,128,244,.28);background:linear-gradient(145deg,rgba(91,124,250,.13),rgba(139,92,246,.07)),var(--panel)}
-.promotion-heading{display:flex;align-items:center;gap:10px}
-.promotion-icon{display:grid;place-items:center;width:32px;height:36px;flex:none;border-radius:10px;
-  background:linear-gradient(145deg,rgba(91,124,250,.24),rgba(139,92,246,.18));color:#C9D2FF}
-.promotion-icon svg{width:19px;height:19px}
-.promotion-label{display:block;font-size:10px;color:#A9B8F4;letter-spacing:.08em}
-.promotion-heading h2{font-size:14px;font-weight:600;line-height:1.7;color:var(--text)}
-.promotion-card p{margin:10px 0 12px;font-size:11px;line-height:1.7;color:var(--text2)}
-.promotion-action{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:34px;
-  padding:7px 10px;border:0;border-radius:8px;background:var(--grad);color:#fff;font-size:12px;font-weight:600;cursor:pointer;transition:filter .15s ease}
-.promotion-action svg{width:14px;height:14px;flex:none}
-.promotion-action:hover:not(:disabled){filter:brightness(1.1)}
+/* ---------- 侧栏购买入口 ---------- */
+.sidebar-purchase{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:36px;flex:none;
+  margin:auto 12px 12px;padding:8px 12px;border:0;border-radius:8px;background:var(--grad);color:#fff;
+  font-size:12px;font-weight:600;cursor:pointer;transition:filter .15s ease}
+.sidebar-purchase svg{width:14px;height:14px;flex:none}
+.sidebar-purchase:hover:not(:disabled){filter:brightness(1.1)}
 
 /* ---------- 顶部工具条 ---------- */
 .toolbar{height:52px;flex:none;display:flex;align-items:center;gap:12px;padding:0 16px;
