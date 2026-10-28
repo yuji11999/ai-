@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getModelInfo, validateGenerationParams } from './provider';
 import { isAbsolute, win32 } from 'node:path';
-import { BUILTIN_MODELS, BUILTIN_URL, type Action, type AppState, type GenerationParams, type Job, type ModelInfo, type Provider, type Reference, type ResultImage, type Task, type TaskKind } from '../shared/types';
+import { BUILTIN_MODELS, BUILTIN_URL, type Action, type AppState, type GenerationParams, type Job, type ModelInfo, type NamingMode, type OutputLayout, type Provider, type QuotaInfo, type Reference, type ResultImage, type Task, type TaskKind } from '../shared/types';
+import { NAMING_PRESETS, presetNamingMode } from '../shared/output-naming';
 
 export interface ProviderImage { bytes?: Uint8Array; url?: string; mime?: string }
 export interface ReferenceInput { name: string; mime: string; data: Uint8Array }
@@ -9,10 +10,11 @@ export interface GenerationService {
   generate(input: { baseURL: string; key: string; params: GenerationParams; prompt: string; references: ReferenceInput[] }): Promise<ProviderImage[]>;
   models(input: { baseURL: string; key: string }): Promise<ModelInfo[]>;
   enhance(input: { baseURL: string; key: string; model?: string; prompt: string; mode: 'optimize' | 'translate' }): Promise<string>;
+  quota?(input: { baseURL: string; key: string }): Promise<QuotaInfo>;
 }
 export interface CredentialStore { get(id: string): Promise<string | undefined>; set(id: string, key: string): Promise<void>; delete(id: string): Promise<void> }
 export interface StoredImage { id: string; url?: string; path?: string; mime?: string }
-export interface OutputContext { taskId: string; taskKind: TaskKind; jobId: string; run: number; row: number; index: number; outputDirectory: string; naming: string; format: 'png' | 'jpg' | 'webp'; createdAt: number }
+export interface OutputContext { taskId: string; taskKind: TaskKind; jobId: string; run: number; row: number; index: number; outputDirectory: string; naming: string; namingMode?: NamingMode; outputLayout?: OutputLayout; sequence?: number; format: 'png' | 'jpg' | 'webp'; createdAt: number }
 export interface OutputService { stage(images: ProviderImage[], context: OutputContext): Promise<StoredImage[]>; recover?(context: OutputContext): Promise<StoredImage[]>; write(image: StoredImage, context: OutputContext): Promise<ResultImage> }
 export interface ReferenceService { read(reference: Reference): Promise<ReferenceInput>; fromResult?(result: ResultImage, existingReferenceIds?: string[]): Promise<Reference> }
 export interface JobRecord { provider: Pick<Provider, 'id' | 'baseURL'>; references: Reference[]; context: OutputContext; rowId: string; credentialRevision: string; sources?: StoredImage[]; completedSourceIds?: string[]; phase: 'generate' | 'download'; terminal?: 'failed' | 'unknown'; terminalError?: string; retryAt?: number }
@@ -49,6 +51,7 @@ export class Engine {
   private timers = new Set<Promise<void>>();
   private transientSources = new Map<string, ProviderImage[]>();
   private tested = new Map<string, ModelInfo[]>();
+  private quotaRequests = new Map<string, Promise<QuotaInfo>>();
   private pumpScheduled = false;
   private pumping = false;
   private repump = false;
@@ -67,6 +70,9 @@ export class Engine {
         this.snapshot = { schemaVersion: 1, state: { tasks: [], providers: [provider], references: [], settings: { outputDirectory: this.options.defaultOutputDirectory ?? '', format: 'png', textProviderId: 'builtin', textModel: BUILTIN_TEXT_MODEL }, version: this.options.version ?? '1.0.0', quota: '暂不可查询' }, jobs: {}, rowIds: {}, credentialRevisions: { builtin: this.id() } };
       }
       this.snapshot.state.settings.naming ??= [...this.snapshot.state.tasks].reverse().find(task => task.kind === 'batch' && !task.archived)?.naming ?? '{序号}_{日期}';
+      this.snapshot.state.settings.namingMode = presetNamingMode(this.snapshot.state.settings.namingMode, this.snapshot.state.settings.naming);
+      this.snapshot.state.settings.naming = NAMING_PRESETS[this.snapshot.state.settings.namingMode];
+      this.snapshot.state.settings.outputLayout ??= 'grouped';
       for (const provider of this.snapshot.state.providers) {
         this.snapshot.credentialRevisions[provider.id] ??= this.id();
         provider.hasKey = Boolean(await this.credential(this.snapshot, provider.id));
@@ -84,13 +90,14 @@ export class Engine {
       await this.options.store.save(this.snapshot); this.initialized = true; this.publish(); for (const [jobId, record] of Object.entries(this.snapshot.jobs)) if (record.retryAt) this.scheduleRetry(jobId, Math.max(0, record.retryAt - this.now())); this.kick(); return this.getState();
     });
   }
-  getState(): AppState { if (!this.snapshot) throw new Error('队列尚未初始化。'); const state = clone(this.snapshot.state); state.tasks = state.tasks.filter(task => !task.archived); return state; }
+  getState(): AppState { if (!this.snapshot) throw new Error('队列尚未初始化。'); const state = clone(this.snapshot.state); state.tasks = state.tasks.filter(task => !task.archived); state.providers.forEach(provider => { provider.configurationRevision = this.snapshot.credentialRevisions[provider.id]; }); state.features = { ...state.features, batchReferencePaths: true, quotaQuery: typeof this.options.provider.quota === 'function', outputOrganization: true }; return state; }
   async getProviderConnection(id: string): Promise<{ baseURL: string; key: string | undefined }> { return this.enqueue(async () => { const provider = this.provider(this.snapshot, id); return { baseURL: provider.baseURL, key: await this.credential(this.snapshot, id) }; }); }
   private credential(draft: EngineSnapshot, id: string): Promise<string | undefined> { const revision = draft.credentialRevisions[id]; return revision ? this.options.credentials.get(credentialSlot(revision)) : Promise.resolve(undefined); }
   hasActiveJobs(): boolean { return Boolean(this.snapshot?.state.tasks.some(task => task.jobs.some(job => ACTIVE.has(job.status)))); }
   async execute(action: Action | string, payload: Record<string, unknown> = {}): Promise<any> {
     if (!this.initialized) throw new Error('队列尚未初始化。');
     if (action === 'getState') return this.getState();
+    if (action === 'queryQuota') return this.queryQuota(payload);
     if (action === 'testProvider') return this.testProvider(payload);
     if (action === 'enhancePrompt') return this.enhance(payload);
     if (action === 'useResult') return this.useResult(payload);
@@ -105,10 +112,23 @@ export class Engine {
         case 'pauseTask': this.task(draft, payload.id).paused = true; break;
         case 'resumeTask': this.task(draft, payload.id).paused = false; break;
         case 'retryFailed': this.retry(draft, payload); break;
-        case 'clearTask': { const task = this.task(draft, payload.id); if (task.jobs.some(job => ACTIVE.has(job.status))) problem('任务仍在执行，请等待完成后清空。'); for (const job of task.jobs) { delete draft.jobs[job.id]; clearedSources.push(job.id); } task.jobs = []; task.rows = []; draft.rowIds[task.id] = []; task.paused = false; break; }
+        case 'clearTask': { const task = this.task(draft, payload.id); if (task.jobs.some(job => ACTIVE.has(job.status))) problem('任务仍在执行，请等待完成后清空。'); for (const job of task.jobs) { delete draft.jobs[job.id]; clearedSources.push(job.id); } task.jobs = []; task.rows = []; task.rowReferenceIds = []; task.rowsPending = false; draft.rowIds[task.id] = []; task.paused = false; break; }
         case 'saveProvider': return this.saveProvider(draft, payload);
         case 'deleteProvider': return this.deleteProvider(draft, payload);
-        case 'saveSettings': { if (payload.outputDirectory !== undefined) draft.state.settings.outputDirectory = directory(payload.outputDirectory); if (payload.naming !== undefined) draft.state.settings.naming = naming(payload.naming); if (payload.format !== undefined) { if (!['png', 'jpg', 'webp'].includes(String(payload.format))) problem('图片格式无效。'); draft.state.settings.format = payload.format as 'png' | 'jpg' | 'webp'; } if (payload.textProviderId !== undefined || payload.textModel !== undefined) { const providerId = safeText(payload.textProviderId ?? draft.state.settings.textProviderId ?? '', '文本供应商', 128); const modelId = safeText(payload.textModel ?? draft.state.settings.textModel ?? '', '文本模型', 200); if (providerId || modelId) { const provider = this.provider(draft, providerId); if (!provider.enabledModels.includes(modelId) || !provider.models.some(model => model.id === modelId && model.text)) problem('请选择该供应商已启用的文本模型，或清空默认文本配置。'); } draft.state.settings.textProviderId = providerId; draft.state.settings.textModel = modelId; } break; }
+        case 'saveSettings': {
+          if (payload.outputDirectory !== undefined) draft.state.settings.outputDirectory = directory(payload.outputDirectory);
+          if (payload.naming !== undefined) { draft.state.settings.naming = naming(payload.naming); if (payload.namingMode === undefined) draft.state.settings.namingMode = presetNamingMode(undefined, draft.state.settings.naming); }
+          if (payload.namingMode !== undefined) {
+            if (!['sequence', 'date', 'date-sequence'].includes(String(payload.namingMode))) problem('文件命名方式无效。');
+            const mode = payload.namingMode as NamingMode;
+            draft.state.settings.namingMode = mode;
+          }
+          draft.state.settings.namingMode = presetNamingMode(draft.state.settings.namingMode, draft.state.settings.naming);
+          draft.state.settings.naming = NAMING_PRESETS[draft.state.settings.namingMode];
+          if (payload.outputLayout !== undefined) { if (!['grouped', 'flat'].includes(String(payload.outputLayout))) problem('图片保存方式无效。'); draft.state.settings.outputLayout = payload.outputLayout as OutputLayout; }
+          if (payload.format !== undefined) { if (!['png', 'jpg', 'webp'].includes(String(payload.format))) problem('图片格式无效。'); draft.state.settings.format = payload.format as 'png' | 'jpg' | 'webp'; }
+          if (payload.textProviderId !== undefined || payload.textModel !== undefined) { const providerId = safeText(payload.textProviderId ?? draft.state.settings.textProviderId ?? '', '文本供应商', 128); const modelId = safeText(payload.textModel ?? draft.state.settings.textModel ?? '', '文本模型', 200); if (providerId || modelId) { const provider = this.provider(draft, providerId); if (!provider.enabledModels.includes(modelId) || !provider.models.some(model => model.id === modelId && model.text)) problem('请选择该供应商已启用的文本模型，或清空默认文本配置。'); } draft.state.settings.textProviderId = providerId; draft.state.settings.textModel = modelId; } break;
+        }
         case 'favoriteResult': { const result = this.result(draft, payload.resultId); result.favorite = !result.favorite; break; }
         case 'removeReference': { const task = this.task(draft, payload.id); task.referenceIds = task.referenceIds.filter(id => id !== payload.referenceId); break; }
         default: problem('此操作必须通过桌面窗口执行。');
@@ -117,7 +137,23 @@ export class Engine {
     });
     this.kick(); return result;
   }
-  async setRows(id: string, rows: string[]): Promise<AppState> { return this.mutate(draft => { const task = this.task(draft, id); if (task.kind !== 'batch') problem('只能向批量任务导入提示词。'); if (task.jobs.some(j => PENDING.has(j.status))) problem('请先等待当前队列结束。'); if (!Array.isArray(rows) || !rows.length || rows.length > 10000) problem('请导入 1 至 10000 行提示词。'); const validated = rows.map(row => safeText(row, '提示词').trim()).filter(Boolean); if (!validated.length || validated.reduce((n, r) => n + Buffer.byteLength(r), 0) > 20 * 1024 * 1024) problem('导入内容为空或超过 20 MB。'); task.rows = validated; draft.rowIds[task.id] = validated.map(() => this.id()); }); }
+  async setRows(id: string, rows: string[], rowReferences?: (Reference | null)[]): Promise<AppState> { return this.mutate(draft => {
+    const task = this.task(draft, id);
+    if (task.kind !== 'batch') problem('只能向批量任务导入提示词。');
+    if (task.jobs.some(j => PENDING.has(j.status))) problem('请先等待当前队列结束。');
+    if (!Array.isArray(rows) || !rows.length || rows.length > 10000 || (rowReferences && rowReferences.length !== rows.length)) problem('请导入 1 至 10000 行提示词。');
+    const validated = rows.map((row, index) => ({ prompt: safeText(row, '提示词').trim(), reference: rowReferences?.[index] ?? null }));
+    if (validated.some(row => !row.prompt && row.reference)) problem('参考图所在行不能为空提示词。');
+    const nonempty = validated.filter(row => row.prompt);
+    if (!nonempty.length || nonempty.reduce((n, row) => n + Buffer.byteLength(row.prompt), 0) > 20 * 1024 * 1024) problem('导入内容为空或超过 20 MB。');
+    const knownReferences = new Set(draft.state.references.map(reference => reference.id));
+    for (const { reference } of nonempty) if (reference) {
+      if (!reference.id || !reference.name || !reference.url) problem('参考图无效。');
+      if (!knownReferences.has(reference.id)) { draft.state.references.push(clone(reference)); knownReferences.add(reference.id); }
+    }
+    task.rows = nonempty.map(row => row.prompt); task.rowReferenceIds = nonempty.map(row => row.reference?.id ?? null); task.rowsPending = true;
+    draft.rowIds[task.id] = nonempty.map(() => this.id());
+  }); }
   async addReferences(id: string, references: Reference[]): Promise<AppState> { return this.mutate(async draft => { const task = this.task(draft, id); const provider = this.provider(draft, task.params.providerId); const model = provider.models.find(m => m.id === task.params.model); if (!model?.reference || task.referenceIds.length + references.length > model.maxReferences) problem('当前模型不支持这些参考图数量。'); for (const reference of references) { if (!reference.id || !reference.name || !reference.url) problem('参考图无效。'); if (!draft.state.references.some(r => r.id === reference.id)) draft.state.references.push(clone(reference)); if (!task.referenceIds.includes(reference.id)) task.referenceIds.push(reference.id); } if (this.options.references) { let bytes = 0; for (const referenceId of task.referenceIds) { const reference = draft.state.references.find(r => r.id === referenceId)!; const input = await this.options.references.read(reference); bytes += input.data.byteLength; if (bytes > 100 * 1024 * 1024) problem('参考图总大小不能超过 100 MB。'); } } }); }
   async markResultSaved(resultId: string): Promise<AppState> { return this.mutate(draft => { this.result(draft, resultId).saved = true; }); }
   async drain(): Promise<void> { for (;;) { await this.serial; if (this.pumpScheduled || this.pumping) { await new Promise(resolve => setImmediate(resolve)); continue; } const pending = [...this.inflight.values(), ...this.timers]; if (!pending.length) return; await Promise.all(pending); } }
@@ -145,13 +181,14 @@ export class Engine {
     const task = this.task(draft, payload.id); if (task.jobs.some(job => PENDING.has(job.status))) return;
     if (task.kind === 'single' && draft.state.tasks.reduce((total, current) => total + current.jobs.filter(job => ACTIVE.has(job.status) || (current.kind === 'single' && !current.paused && job.status === 'queued' && (draft.jobs[job.id]?.retryAt ?? 0) <= this.now())).length, 0) >= MAX_CONCURRENT_JOBS) problem('当前已有 5 个请求正在处理或等待处理，请等待完成后再提交。');
     if (task.jobs.some(job => job.status === 'unknown') && payload.confirmUnknown !== true) problem('上次生成结果未知，可能已扣费；请先明确确认重试。');
-    this.validateParams(draft, task.params, task.referenceIds.length); const provider = this.provider(draft, task.params.providerId); if (!await this.credential(draft, provider.id)) problem('请先在设置中保存 API Key。');
+    this.validateParams(draft, task.params, task.kind === 'batch' ? (task.rowReferenceIds?.some(Boolean) ? 1 : 0) : task.referenceIds.length); const provider = this.provider(draft, task.params.providerId); if (!await this.credential(draft, provider.id)) problem('请先在设置中保存 API Key。');
     if (provider.connection !== 'connected' || !provider.models.find(m => m.id === task.params.model)?.verified) problem('请先测试连接并验证当前生图模型。');
     const prompts = task.kind === 'single' ? [task.prompt.trim()] : task.rows; if (!prompts.length || prompts.some(p => !p.trim())) problem('请填写提示词或先导入批量提示词。');
     const run = task.jobs.reduce((highest, job) => Math.max(highest, job.run), 0) + 1; task.paused = false;
-    const refs = task.referenceIds.map(id => draft.state.references.find(r => r.id === id) ?? problem('参考图已失效，请重新添加。'));
+    const referencesById = new Map(draft.state.references.map(reference => [reference.id, reference]));
     if (task.kind === 'single') draft.rowIds[task.id] = [this.id()];
-    for (let index = 0; index < prompts.length; index++) { const job: Job = { id: this.id(), row: index + 1, run, prompt: prompts[index], referenceIds: [...task.referenceIds], params: clone(task.params), status: 'queued', results: [], createdAt: this.now(), attempts: 0 }; task.jobs.push(job); draft.jobs[job.id] = { provider: { id: provider.id, baseURL: provider.baseURL }, references: clone(refs), rowId: draft.rowIds[task.id]?.[index] ?? this.id(), credentialRevision: draft.credentialRevisions[provider.id], phase: 'generate', context: { taskId: task.id, taskKind: task.kind, jobId: job.id, run, row: job.row, index: 1, outputDirectory: draft.state.settings.outputDirectory, naming: draft.state.settings.naming ?? '{序号}_{日期}', format: draft.state.settings.format, createdAt: job.createdAt } }; }
+    for (let index = 0; index < prompts.length; index++) { const referenceIds = task.kind === 'batch' ? (task.rowReferenceIds?.[index] ? [task.rowReferenceIds[index]!] : []) : [...task.referenceIds]; const refs = referenceIds.map(id => referencesById.get(id) ?? problem(`第 ${index + 1} 行参考图已失效，请重新导入。`)); const job: Job = { id: this.id(), row: index + 1, run, prompt: prompts[index], referenceIds, params: clone(task.params), status: 'queued', results: [], createdAt: this.now(), attempts: 0 }; task.jobs.push(job); draft.jobs[job.id] = { provider: { id: provider.id, baseURL: provider.baseURL }, references: clone(refs), rowId: draft.rowIds[task.id]?.[index] ?? this.id(), credentialRevision: draft.credentialRevisions[provider.id], phase: 'generate', context: { taskId: task.id, taskKind: task.kind, jobId: job.id, run, row: job.row, index: 1, outputDirectory: draft.state.settings.outputDirectory, naming: NAMING_PRESETS[presetNamingMode(draft.state.settings.namingMode, draft.state.settings.naming)], namingMode: presetNamingMode(draft.state.settings.namingMode, draft.state.settings.naming), outputLayout: draft.state.settings.outputLayout ?? 'grouped', sequence: index * task.params.count + 1, format: draft.state.settings.format, createdAt: job.createdAt } }; }
+    if (task.kind === 'batch') task.rowsPending = false;
   }
   private retry(draft: EngineSnapshot, payload: Record<string, unknown>): void { const task = this.task(draft, payload.id); if (task.jobs.some(job => job.status === 'unknown') && !task.jobs.some(job => job.status === 'failed') && payload.confirmUnknown !== true) problem('存在结果未知的请求，可能已扣费。请明确确认后重新生成。'); for (const job of task.jobs) if (job.status === 'failed' || job.status === 'unknown' && payload.confirmUnknown === true) { const record = draft.jobs[job.id]; if (!record) continue; if (record.phase === 'download' && !record.sources?.length && !this.transientSources.has(job.id)) { job.error = '图片源未能保存，无法恢复下载；不会重新生成。'; continue; } if (record.phase === 'generate') { const provider = this.provider(draft, job.params.providerId); if (!provider.hasKey) problem('请先保存 API Key。'); if (provider.baseURL !== record.provider.baseURL || draft.credentialRevisions[provider.id] !== record.credentialRevision) problem('供应商地址或 Key 已更改，旧请求不能重试；请检查配置后发起新一轮生成。'); this.validateParams(draft, job.params, record.references.length); if (provider.connection !== 'connected') problem('请先测试连接并保存供应商。'); } job.status = 'queued'; job.error = undefined; job.endedAt = undefined; record.retryAt = undefined; } task.paused = false; }
   private providerBusy(draft: EngineSnapshot, id: string): boolean { return draft.state.tasks.some(task => task.jobs.some(job => job.params.providerId === id && PENDING.has(job.status))); }
@@ -173,6 +210,41 @@ export class Engine {
     return this.getState();
   }
   private async deleteProvider(draft: EngineSnapshot, payload: Record<string, unknown>): Promise<AppState> { const provider = this.provider(draft, payload.id); if (this.providerBusy(draft, provider.id)) problem('此供应商仍有排队或进行中的请求，不能删除。'); const revision = draft.credentialRevisions[provider.id]; draft.state.providers = draft.state.providers.filter(p => p.id !== provider.id); delete draft.credentialRevisions[provider.id]; if (draft.state.settings.textProviderId === provider.id) { draft.state.settings.textProviderId = ''; draft.state.settings.textModel = ''; } for (const task of draft.state.tasks) if (task.params.providerId === provider.id) task.params = { providerId: '', model: '', quality: '', size: '', count: 1 }; await this.commit(draft); if (revision) await this.options.credentials.delete(credentialSlot(revision)).catch(() => undefined); return this.getState(); }
+  private async queryQuota(payload: Record<string, unknown>): Promise<QuotaInfo> {
+    if (!this.options.provider.quota) problem('当前版本未启用额度查询。');
+    // Only use the selected provider's saved address and immutable credential slot.
+    const capture = await this.enqueue(async () => {
+      const provider = this.provider(this.snapshot, payload.id);
+      const key = await this.credential(this.snapshot, provider.id);
+      if (!key) problem('请先保存此供应商的 API Key。');
+      return { id: provider.id, baseURL: provider.baseURL, key: key!, revision: this.snapshot.credentialRevisions[provider.id] };
+    });
+    const identity = `${capture.id}:${capture.revision}`;
+    const pending = this.quotaRequests.get(identity);
+    if (pending) return pending;
+    const operation = (async () => {
+      let result: QuotaInfo;
+      try { result = await this.options.provider.quota!({ baseURL: capture.baseURL, key: capture.key }); }
+      catch (error) {
+        const detail = (error ?? {}) as { status?: number; code?: string };
+        if (detail.status === 401 || detail.status === 403) problem('额度查询未获授权，请检查此供应商的 API Key。');
+        if ([404, 405, 501].includes(detail.status ?? 0)) problem('上游未开放 Sub2API 额度查询接口，请在供应商控制台查看。');
+        if (detail.status === 429) problem('额度查询过于频繁，请稍后再试。');
+        if (detail.code === 'QUOTA_UNAVAILABLE' || detail.code === 'INVALID_RESPONSE') problem('上游未返回可识别的额度信息，请在供应商控制台查看。');
+        if (detail.code === 'REDIRECT') problem('额度接口返回重定向，已停止查询，请检查供应商地址。');
+        if (detail.code === 'TIMEOUT') problem('额度查询超时，请稍后刷新。');
+        problem('额度查询失败，请检查网络或供应商服务后刷新。');
+      }
+      await this.enqueue(async () => {
+        const current = this.snapshot.state.providers.find(provider => provider.id === capture.id);
+        if (!current || current.baseURL !== capture.baseURL || this.snapshot.credentialRevisions[capture.id] !== capture.revision) problem('供应商配置已改变，请重新查询额度。');
+      });
+      return result!;
+    })();
+    this.quotaRequests.set(identity, operation);
+    try { return await operation; }
+    finally { if (this.quotaRequests.get(identity) === operation) this.quotaRequests.delete(identity); }
+  }
   private async testProvider(payload: Record<string, unknown>): Promise<ModelInfo[]> {
     // Capture only saved credentials for the exact saved URL, never a draft origin.
     const request = await this.enqueue(async () => { const existing = payload.id ? this.provider(this.snapshot, payload.id) : undefined; const url = baseURL(payload.baseURL ?? existing?.baseURL); let key = payload.key ? safeText(payload.key, 'API Key', 4096).trim() : ''; if (!key && existing?.baseURL === url) key = await this.credential(this.snapshot, existing.id) ?? ''; if (!key) problem('请输入 API Key；测试新地址不能自动使用已保存的 Key。'); return { id: existing?.id, baseURL: url, key }; });

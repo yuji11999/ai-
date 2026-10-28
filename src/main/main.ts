@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ClipboardItem, dialog, ipcMain, net, protocol, safeStorage, session, shell } from 'electron';
+import { app, BrowserWindow, clipboard, ClipboardItem, dialog, ipcMain, net, protocol, safeStorage, screen, session, shell } from 'electron';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { mkdir, realpath } from 'node:fs/promises';
@@ -7,8 +7,10 @@ import { CredentialVault } from './credentials';
 import { Engine } from './engine';
 import { SQLiteStore } from './store';
 import { FileService } from './files';
+import { importBatchReferences } from './batch-import';
 import { ImageProvider } from './provider';
 import { PRODUCT } from './product';
+import { initialWindowBounds } from './window-layout';
 
 app.setName(PRODUCT.name);
 // The development window has its own database and lock, so it can run beside the installed app.
@@ -69,8 +71,10 @@ async function execute(action:Action,p:Record<string,unknown>):Promise<unknown> 
    const task=getTask(p.id);if(task.kind!=='batch')throw new Error('仅批量任务支持导入');
    const selected=await dialog.showOpenDialog(win,{title:'导入提示词表格',properties:['openFile'],filters:[{name:'Excel 表格',extensions:['xlsx']}]});
    if(selected.canceled||!selected.filePaths[0])return engine.getState();
+   if(getTask(task.id).jobs.some(job=>['queued','submitting','running','downloading'].includes(job.status)))throw new Error('请先等待当前队列结束。');
    const rows=await files.importRows(selected.filePaths[0]);
-   return engine.setRows(task.id,rows);
+   const references=await importBatchReferences(rows,selected.filePaths[0],{importReferences:paths=>files.importReferences(paths)});
+   return engine.setRows(task.id,rows.map(row=>row.prompt),references);
  });
  case 'downloadBatchTemplate':return nativeOnce('batch-template',async()=>{
    const selected=await dialog.showSaveDialog(win,{title:'保存批量提示词模板',defaultPath:'批量提示词模板.xlsx',filters:[{name:'Excel 表格',extensions:['xlsx']}]});
@@ -170,7 +174,8 @@ async function start() {
  });
  session.defaultSession.setPermissionRequestHandler((_webContents,_permission,callback)=>callback(false));
  session.defaultSession.setPermissionCheckHandler(()=>false);
- window=new BrowserWindow({width:1600,height:1000,minWidth:1100,minHeight:720,frame:false,backgroundColor:'#0b0e15',title:isDev?'轻图 · 开发版':PRODUCT.name,show:false,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
+ const workArea=screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+ window=new BrowserWindow({...initialWindowBounds(workArea),frame:false,backgroundColor:'#0b0e15',title:isDev?'轻图 · 开发版':PRODUCT.name,show:false,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
  window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
  if(isDev) window.on('page-title-updated',event=>event.preventDefault());
  window.webContents.on('will-navigate',event=>event.preventDefault());

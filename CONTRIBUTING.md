@@ -11,7 +11,7 @@
 
 ```powershell
 npm run typecheck
-node --import tsx --test src/renderer/*.test.ts tests/batch-template.test.ts tests/concurrency-limit.test.ts tests/output-settings.test.ts tests/reference-preview.test.ts tests/task-actions.test.ts
+node --import tsx --test src/renderer/*.test.ts tests/batch-template.test.ts tests/batch-references.test.ts tests/concurrency-limit.test.ts tests/output-settings.test.ts tests/reference-preview.test.ts tests/task-actions.test.ts
 npx vite build --emptyOutDir false
 node scripts/build-main.mjs
 ```
@@ -31,3 +31,7 @@ node scripts/build-main.mjs
 ## 提交前
 
 检查 `git status`，确保只包含需要的源码和文档，不包含用户数据、Key、数据库、生成图片、日志或依赖缓存。不要根据测试样例推断真实接口已经验证。`VALIDATION.txt` 与 `SOURCE_SHA256.json` 保留原始交付信息，不能用作当前版本的测试或完整性证明。
+
+开发版的凭据、任务数据库和参考图位于 `%APPDATA%/轻图-dev`，默认成图位于系统图片目录下的 `轻图`；这些路径在源码仓库之外。不要将它们复制进仓库。仓库已忽略本机认证配置、私钥、编辑器个人配置，以及根目录下约定的数据和导出目录；`.env.example` 等示例文件只能放占位符。可以用 `git check-ignore -v -- 路径` 核对某个文件是否被忽略，并用 `git diff --cached --name-only` 核对暂存文件。
+
+忽略规则对已经跟踪的文件及 `git add -f` 无效，也不会从磁盘或已有历史中移除内容。Git 提交会包含作者姓名、邮箱；公开提交应使用 GitHub 提供的隐私邮箱。直接压缩整个工作目录时不会应用 `.gitignore`，分享源码应从 Git 中导出经过检查的版本。

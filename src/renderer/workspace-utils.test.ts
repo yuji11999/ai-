@@ -19,13 +19,12 @@ test('the active draft appears on first submit and later runs remain in the same
   const otherDraft = task('saved-draft', 'single');
   const current = task('current', 'single');
   const batch = task('batch', 'batch', [submitted]);
-  assert.deepEqual(visibleWorkspaceTasks([otherDraft, current, batch], 'single', current.id).map(item => item.id), []);
+  assert.deepEqual(visibleWorkspaceTasks([otherDraft, current, batch], 'single').map(item => item.id), []);
   current.jobs.push(submitted);
-  assert.deepEqual(visibleWorkspaceTasks([otherDraft, current, batch], 'single', current.id).map(item => item.id), ['current']);
+  assert.deepEqual(visibleWorkspaceTasks([otherDraft, current, batch], 'single').map(item => item.id), ['current']);
   current.jobs.push({ ...submitted, id: 'second-run' });
-  assert.deepEqual(visibleWorkspaceTasks([otherDraft, current, batch], 'single', current.id).map(item => item.id), ['current']);
-  assert.deepEqual(visibleWorkspaceTasks([otherDraft, current, batch], 'single', 'another-task').map(item => item.id), ['current']);
-  assert.deepEqual(visibleWorkspaceTasks([task('batch-draft', 'batch'), batch], 'batch', batch.id).map(item => item.id), ['batch-draft', 'batch']);
+  assert.deepEqual(visibleWorkspaceTasks([otherDraft, current, batch], 'single').map(item => item.id), ['current']);
+  assert.deepEqual(visibleWorkspaceTasks([task('batch-draft', 'batch'), batch], 'batch').map(item => item.id), ['batch-draft', 'batch']);
 });
 
 test('clearing the composer requires a newly accepted single-task job', () => {

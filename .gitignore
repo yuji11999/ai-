@@ -11,7 +11,7 @@ test-results/
 .env
 .env.*
 !.env.example
-credentials.json
+credentials*.json
 *.sqlite
 *.sqlite-*
 *.db
@@ -19,3 +19,41 @@ credentials.json
 *.tmp
 .DS_Store
 Thumbs.db
+
+# 本机认证配置和私钥；示例文件只能填写占位符
+.npmrc
+.netrc
+_netrc
+.git-credentials
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 编辑器的本机路径、历史和个人配置
+.vscode/
+.idea/
+.vs/
+.history/
+*.suo
+*.user
+*.code-workspace
+
+# 误放在项目根目录的运行数据、参考图、成图和导出副本
+/data/
+/user-data/
+/userdata/
+/output/
+/outputs/
+/references/
+/generated/
+/exports/
+/backup/
+/backups/
+/assets.json
+/*.zip
+/*.7z
+/*.rar
+/*.tar
+/*.tar.gz
+/*.bundle

@@ -1,11 +1,15 @@
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { Action, AppState, GenerationParams, Job, ModelInfo, Provider, Settings, Task, TaskKind } from '../shared/types';
+import type { Action, AppState, GenerationParams, Job, ModelInfo, OutputLayout, Provider, QuotaInfo, Settings, Task, TaskKind } from '../shared/types';
 import { activeJob, aspectRatio, is1kPreset, isAppState, modelChoices, normalizeParams, pendingImageSlots, sizeForRatio, sizeForResolution, statusLabels, summarizeTask, textModelChoices, textSelectionValue, selectedImageModel } from './model-utils';
 import { IMAGE_RATIO_PRESETS } from '../shared/image-presets';
 import { clearPromptIfUnchanged, findWorkspaceDraft, groupJobsByRun, hasNewSingleSubmission, visibleWorkspaceTasks, workspaceTaskLabel } from './workspace-utils';
 import { affectedReferenceMarker, findMentionRange, insertReferenceMention, type MentionRange } from './reference-mentions';
 import { Select } from './Select';
+import { movePreview, selectPreview, type PreviewImage, type PreviewSelection } from './preview-utils';
+import { isQuotaInfo, quotaDetails, quotaText } from './quota-utils';
+import { NAMING_PRESETS, outputName, presetNamingMode } from '../shared/output-naming';
+import { PRODUCT } from '../shared/product';
 
 type Page = 'gen' | 'batch' | 'providers' | 'settings' | 'about';
 type Notice = { message: string; error: boolean };
@@ -61,7 +65,7 @@ function useBridge() {
     return () => { live = false; alive.current = false; unsubscribe(); };
   }, [online, request, notify]);
   const api = useMemo<API>(() => ({ state, online, busy: key => pending.includes(key), request, notify }), [state, online, pending, request, notify]);
-  return { api, notice, dismiss: () => setNotice(null) };
+  return { api, notice };
 }
 
 function Icon({ name }: { name: Page }) {
@@ -76,10 +80,35 @@ function Icon({ name }: { name: Page }) {
 }
 function Status({ status, children }: { status: Job['status']; children?: React.ReactNode }) {
   const type = status === 'completed' ? 'ok' : ['failed', 'unknown'].includes(status) ? 'fail' : ['queued'].includes(status) ? 'queue' : 'run';
-  return <span className={`st st-${type}`}><i />{children ?? statusLabels[status]}</span>;
+  return <span className={`st st-${type}`} title={typeof children === 'string' ? children : statusLabels[status]}><i aria-hidden="true" /><span className="st-label">{children ?? statusLabels[status]}</span></span>;
 }
 function Empty({ title, children }: { title: string; children?: React.ReactNode }) {
   return <div className="empty-state"><div className="empty-icon">◇</div><h3>{title}</h3><div>{children}</div></div>;
+}
+function QuotaStatus({ provider }: { provider?: Provider }) {
+  const { state, online, notify } = useAPI();
+  const [quota, setQuota] = useState<QuotaInfo | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const lock = useRef(false);
+  const alive = useRef(true);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+  const enabled = online && state?.features?.quotaQuery && provider?.hasKey;
+  const query = async () => {
+    if (!enabled || !provider || lock.current) return;
+    lock.current = true; setLoading(true); setError('');
+    try {
+      const result: unknown = await window.qingtu.invoke('queryQuota', { id: provider.id });
+      if (!isQuotaInfo(result)) throw new Error('额度响应无法识别，请重启程序后重试。');
+      if (alive.current) setQuota(result);
+    } catch (cause) {
+      if (alive.current) { const message = messageOf(cause); setQuota(null); setError(message); notify(message, true); }
+    } finally { lock.current = false; if (alive.current) setLoading(false); }
+  };
+  const unavailable = !online ? '未连接' : !state ? '正在连接' : !provider ? '请选择模型' : !provider.hasKey ? '未配置 Key' : !state.features?.quotaQuery ? '重启后可查询' : '点击查询';
+  const text = loading ? '额度 · 查询中…' : error ? '额度 · 查询失败' : quota ? quotaText(quota) : `额度 · ${unavailable}`;
+  const title = [provider?.name, error || (quota ? quotaDetails(quota) : unavailable)].filter(Boolean).join('\n');
+  return <button type="button" className={`quota-status ${error ? 'quota-status--error' : ''}`} disabled={!enabled || loading} title={title} aria-label={`${loading ? '正在查询' : '查询'}${provider?.name ?? ''}的额度`} onClick={() => void query()}><span>{text}</span><svg className={loading ? 'quota-refresh is-loading' : 'quota-refresh'} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M15.5 6a6 6 0 1 0 .5 7M15.5 2.5V6H12" strokeLinecap="round" strokeLinejoin="round" /></svg></button>;
 }
 function Modal({ title, onClose, children, footer, busy = false, className = '' }: { title: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; busy?: boolean; className?: string }) {
   const panel = useRef<HTMLDivElement>(null);
@@ -91,7 +120,9 @@ function Modal({ title, onClose, children, footer, busy = false, className = '' 
     const root = document.getElementById('root');
     const wasInert = root?.inert ?? false;
     if (root) root.inert = true;
-    node?.querySelector<HTMLElement>('input:not(:disabled), button:not(:disabled), [tabindex="0"]')?.focus();
+    const initialFocus = node?.querySelector<HTMLElement>('input:not(:disabled), textarea:not(:disabled)')
+      ?? node?.querySelector<HTMLElement>('button:not(:disabled), [tabindex="0"]');
+    initialFocus?.focus();
     const keydown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !busyRef.current) { event.preventDefault(); closeRef.current(); }
       if (event.key !== 'Tab') return;
@@ -123,15 +154,20 @@ function Sidebar({ page, setPage }: { page: Page; setPage: (page: Page) => void 
   const { request, online } = useAPI();
   const [slide, setSlide] = useState(0);
   const [hover, setHover] = useState(false);
-  useEffect(() => { if (hover) return; const timer = setInterval(() => setSlide(value => (value + 1) % 3), 5000); return () => clearInterval(timer); }, [hover]);
+  const ads = [
+    { key: 'ad0' as const, title: '✦ 生图模型', description: '连接供应商，启用你的生图模型', tone: '' },
+    { key: 'ad1' as const, title: '⚡ 供应商服务', description: '查看节点服务与额度信息', tone: 'ad--hot' },
+    { key: 'ad2' as const, title: '📚 提示词使用指南', description: '了解参考图与提示词的使用方式', tone: 'ad--cool' },
+  ].filter(ad => Boolean(PRODUCT.links[ad.key]));
+  const activeSlide = ads.length ? slide % ads.length : 0;
+  useEffect(() => { if (hover || ads.length < 2) return; const timer = setInterval(() => setSlide(value => (value + 1) % ads.length), 5000); return () => clearInterval(timer); }, [hover, ads.length]);
   const navigation: [Page, string][] = [['gen', '生成'], ['batch', '批量生图'], ['providers', '供应商设置'], ['settings', '基础设置'], ['about', '关于']];
-  const ads = [ ['✦ 生图模型', '连接供应商，启用你的生图模型'], ['⚡ 供应商服务', '查看节点服务与额度信息'], ['📚 提示词使用指南', '了解参考图与提示词的使用方式'] ];
   return <aside className="sidebar"><nav className="nav" aria-label="主导航">
     {navigation.map(([id, label], index) => <React.Fragment key={id}>{(index === 0 || index === 2) && <div className="sec">{index === 0 ? '生成' : '系统'}</div>}<button className={`nav-item ${page === id ? 'on' : ''}`} aria-current={page === id ? 'page' : undefined} onClick={() => setPage(id)}><Icon name={id} />{label}</button></React.Fragment>)}
-  </nav><div className="adbox" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
-    <button className="ad-main" disabled={!online} onClick={() => void request('openLink', { name: `ad${slide}` })}><div className="ad-slides" style={{ transform: `translateX(-${slide * 100}%)` }}>{ads.map(([title, description], index) => <div className={`ad ${index === 1 ? 'ad--hot' : index === 2 ? 'ad--cool' : ''}`} key={title}><div className="ad-t">{title}</div><div className="ad-d">{description}</div></div>)}</div><span className="ad-go">了解详情 →</span></button>
-    <div className="ad-dots">{ads.map((_, i) => <button key={i} aria-label={`资讯 ${i + 1}`} className={slide === i ? 'on' : ''} onClick={() => setSlide(i)} />)}</div>
-  </div></aside>;
+  </nav>{ads.length > 0 && <div className="adbox" onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
+    <button className="ad-main" disabled={!online} onClick={() => void request('openLink', { name: ads[activeSlide].key })}><div className="ad-slides" style={{ transform: `translateX(-${activeSlide * 100}%)` }}>{ads.map(ad => <div className={`ad ${ad.tone}`} key={ad.key}><div className="ad-t">{ad.title}</div><div className="ad-d">{ad.description}</div></div>)}</div><span className="ad-go">了解详情 →</span></button>
+    {ads.length > 1 && <div className="ad-dots">{ads.map((_, i) => <button key={i} aria-label={`资讯 ${i + 1}`} className={activeSlide === i ? 'on' : ''} onClick={() => setSlide(i)} />)}</div>}
+  </div>}</aside>;
 }
 
 type Draft = Pick<Task, 'prompt' | 'params' | 'concurrency' | 'retry'>;
@@ -202,6 +238,7 @@ function TaskList({ kind, selected, select, startNew, deleteTask }: { kind: Task
   const [name, setName] = useState('');
   const [deleting, setDeleting] = useState<Task | null>(null);
   const [deletingBusy, setDeletingBusy] = useState(false);
+  const taskTypeName = kind === 'single' ? '对话' : '批量任务';
   const renameInput = useRef<HTMLInputElement>(null);
   useEffect(() => { if (renaming) { renameInput.current?.focus(); renameInput.current?.select(); } }, [renaming]);
   const rename = async () => {
@@ -209,34 +246,36 @@ function TaskList({ kind, selected, select, startNew, deleteTask }: { kind: Task
     const result = await request('renameTask', { id: renaming.id, title: name }, `rename:${renaming.id}`);
     if (result !== undefined) { setRenaming(null); notify('名称已更新。'); }
   };
-  const tasks = visibleWorkspaceTasks(state?.tasks ?? [], kind, selected).filter(task => `${task.prompt} ${workspaceTaskLabel(task)} ${task.title}`.toLowerCase().includes(query.trim().toLowerCase()));
+  const tasks = visibleWorkspaceTasks(state?.tasks ?? [], kind).filter(task => `${task.prompt} ${workspaceTaskLabel(task)} ${task.title}`.toLowerCase().includes(query.trim().toLowerCase()));
   return <aside className="panel panel--l"><div className="sec-box task-new">{kind === 'single' ? <><div className="task-list-heading"><b>创作记录</b><button className="btn task-add" onClick={startNew} disabled={!online || !state || busy(`create:${kind}`)}>{busy(`create:${kind}`) ? '准备中…' : '＋ 新建'}</button></div><input className="ipt task-search" aria-label="搜索任务" placeholder="搜索创作记录" value={query} onChange={event => setQuery(event.target.value)} /></> : <button className="btn full" onClick={startNew} disabled={!online || !state || busy(`create:${kind}`)}>{busy(`create:${kind}`) ? '准备中…' : '＋ 新建任务'}</button>}</div>
     <div className="sec-box task-list">{tasks.length ? tasks.map(task => { const stats = summarizeTask(task); const label = workspaceTaskLabel(task); return <div key={task.id} className={`task task-entry ${selected === task.id ? 'on' : ''}`}>
       <button type="button" className="task-select" onClick={() => select(task.id)} aria-current={selected === task.id ? 'true' : undefined}>
         {kind === 'single' && <div className="thumb">{stats.results[0] ? <img src={stats.results[0].url} alt="" /> : <span>◇</span>}</div>}
         <div className="info"><div className="pt" title={label}>{label}{kind === 'batch' && ` · ${task.rows.length} 条`}</div><div className="mt"><Status status={stats.status}>{task.jobs.length ? stats.label : '草稿'}</Status>{kind === 'single' && <span>{new Date(task.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>}</div>{(stats.active || stats.queued > 0) && <div className="pg" aria-label={`完成 ${stats.completed} / ${stats.total}`}><i style={{ width: `${stats.total ? stats.completed / stats.total * 100 : 0}%` }} /></div>}</div>
       </button>
-      {kind === 'single' && <div className="task-actions"><button type="button" className="task-action" aria-label={`重命名 ${label}`} title="重命名" onClick={() => { setName(label.slice(0, 100)); setRenaming(task); }}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m4 20 4-.8L19 8.2 15.8 5 4.8 16zM14.5 6.3l3.2 3.2" strokeLinejoin="round" /></svg></button><button type="button" className="task-action task-action-delete" aria-label={`删除 ${label}`} title={stats.active || stats.queued > 0 ? '任务进行中，暂不能删除' : '删除'} disabled={Boolean(stats.active || stats.queued > 0)} onClick={() => setDeleting(task)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 10v7m4-7v7" strokeLinecap="round" strokeLinejoin="round" /></svg></button></div>}
+      <div className="task-actions"><button type="button" className="task-action" aria-label={`重命名 ${label}`} title="重命名" onClick={() => { setName(label.slice(0, 100)); setRenaming(task); }}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m4 20 4-.8L19 8.2 15.8 5 4.8 16zM14.5 6.3l3.2 3.2" strokeLinejoin="round" /></svg></button><button type="button" className="task-action task-action-delete" aria-label={`删除 ${label}`} title={stats.active || stats.queued > 0 ? '任务进行中，暂不能删除' : '删除'} disabled={Boolean(stats.active || stats.queued > 0)} onClick={() => setDeleting(task)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-9 0 1 13h10l1-13M10 10v7m4-7v7" strokeLinecap="round" strokeLinejoin="round" /></svg></button></div>
     </div>; }) : <p className="empty-note">{query ? '没有匹配的创作记录' : online ? '提交任务后将在这里显示' : '桌面服务未连接'}</p>}</div>
-    {renaming && <Modal title="重命名对话" onClose={() => setRenaming(null)} busy={busy(`rename:${renaming.id}`)} className="task-dialog" footer={<><button className="btn" onClick={() => setRenaming(null)} disabled={busy(`rename:${renaming.id}`)}>取消</button><button className="btn btn--pri" disabled={!name.trim() || busy(`rename:${renaming.id}`)} onClick={() => void rename()}>保存</button></>}><div className="frow"><label htmlFor="task-name">对话名称</label><input ref={renameInput} id="task-name" className="ipt" value={name} maxLength={100} disabled={busy(`rename:${renaming.id}`)} onChange={event => setName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); void rename(); } }} /></div></Modal>}
-    {deleting && <Confirm title="删除对话" onClose={() => setDeleting(null)} busy={deletingBusy} onConfirm={() => { setDeletingBusy(true); void deleteTask(deleting).then(success => { if (success) { setDeleting(null); notify('对话已删除。'); } }).finally(() => setDeletingBusy(false)); }}>确定删除“{workspaceTaskLabel(deleting)}”吗？对话会从列表移除，已生成的图片文件和历史数据会保留。</Confirm>}
+    {renaming && <Modal title={`重命名${taskTypeName}`} onClose={() => setRenaming(null)} busy={busy(`rename:${renaming.id}`)} className="task-dialog" footer={<><button className="btn" onClick={() => setRenaming(null)} disabled={busy(`rename:${renaming.id}`)}>取消</button><button className="btn btn--pri" disabled={!name.trim() || busy(`rename:${renaming.id}`)} onClick={() => void rename()}>保存</button></>}><div className="frow"><label htmlFor="task-name">{taskTypeName}名称</label><input ref={renameInput} id="task-name" className="ipt" value={name} maxLength={100} disabled={busy(`rename:${renaming.id}`)} onChange={event => setName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.nativeEvent.isComposing) { event.preventDefault(); void rename(); } }} /></div></Modal>}
+    {deleting && <Confirm title={`删除${taskTypeName}`} onClose={() => setDeleting(null)} busy={deletingBusy} onConfirm={() => { setDeletingBusy(true); void deleteTask(deleting).then(success => { if (success) { setDeleting(null); notify(`${taskTypeName}已删除。`); } }).finally(() => setDeletingBusy(false)); }}>确定删除“{workspaceTaskLabel(deleting)}”吗？{taskTypeName}会从列表移除，已生成的图片文件和历史数据会保留。</Confirm>}
   </aside>;
 }
 
 type LocalSubmission = { taskId: string; count: number; previousJobs: number; prompt: string; referenceIds: string[] };
-type PreviewImage = { kind: 'result' | 'reference'; id: string; name: string };
 function PendingImage({ phase, paused = false, run }: { phase: string; paused?: boolean; run: number }) {
   return <div className="image-pending" role="status" aria-label={`第 ${run} 轮，${phase}，等待图片`}><div className="image-pending-inner"><span className={`image-pending-spinner ${paused ? 'is-paused' : ''}`} aria-hidden="true" /><span className="image-pending-title">正在处理图片</span><span className="image-pending-phase">{phase}</span></div></div>;
 }
-function UserMessage({ prompt, referenceIds, onPreview }: { prompt: string; referenceIds: string[]; onPreview: (image: PreviewImage) => void }) {
+function UserMessage({ prompt, referenceIds, onPreview }: { prompt: string; referenceIds: string[]; onPreview: (image: PreviewImage, images: PreviewImage[]) => void }) {
   const { state } = useAPI();
-  return <div className="conversation-user"><div className="conversation-prompt">{prompt}</div>{referenceIds.length > 0 && <div className="conversation-references" aria-label="本轮参考图">{referenceIds.map(id => { const ref = state?.references.find(item => item.id === id); return ref ? <button type="button" className="conversation-reference" key={id} aria-label={`预览参考图 ${ref.name}`} title="点击预览参考图" onClick={() => onPreview({ kind: 'reference', id: ref.id, name: ref.name })}><img src={ref.url} alt="" /></button> : <span key={id} className="conversation-reference-missing">参考图不可用</span>; })}</div>}</div>;
+  const images: PreviewImage[] = referenceIds.flatMap(id => { const reference = state?.references.find(item => item.id === id); return reference ? [{ kind: 'reference' as const, id: reference.id, name: reference.name }] : []; });
+  return <div className="conversation-user"><div className="conversation-prompt">{prompt}</div>{referenceIds.length > 0 && <div className="conversation-references" aria-label="本轮参考图">{referenceIds.map(id => { const ref = state?.references.find(item => item.id === id); return ref ? <button type="button" className="conversation-reference" key={id} aria-label={`预览参考图 ${ref.name}`} title="点击预览参考图" onClick={() => onPreview({ kind: 'reference', id: ref.id, name: ref.name }, images)}><img src={ref.url} alt="" /></button> : <span key={id} className="conversation-reference-missing">参考图不可用</span>; })}</div>}</div>;
 }
 function ResultCanvas({ task, localSubmission }: { task: Task; localSubmission: LocalSubmission | null }) {
   const { request, busy } = useAPI();
   const stats = summarizeTask(task);
   const [retryUnknown, setRetryUnknown] = useState(false);
-  const [preview, setPreview] = useState<PreviewImage | null>(null);
+  const [preview, setPreview] = useState<PreviewSelection | null>(null);
+  const resultImages: PreviewImage[] = stats.results.map(result => ({ kind: 'result', id: result.id, name: result.name }));
+  const openPreview = (image: PreviewImage, images: PreviewImage[]) => setPreview(selectPreview(images, image));
   const scrollPanel = useRef<HTMLDivElement>(null);
   const followLatest = useRef(true);
   const runs = groupJobsByRun(task.jobs);
@@ -244,35 +283,51 @@ function ResultCanvas({ task, localSubmission }: { task: Task; localSubmission: 
   const localCount = local?.count ?? 0;
   const nextRun = task.jobs.reduce((highest, job) => Math.max(highest, job.run), 0) + 1;
   useLayoutEffect(() => { const node = scrollPanel.current; if (node && (followLatest.current || localCount > 0)) { node.scrollTop = node.scrollHeight; followLatest.current = true; } }, [task.id, task.jobs.length, localCount]);
-  return <main className="canvas"><div className="canvas-h"><span className="title">{task.title || '生成'} · <b>{stats.results.length} 张</b></span>{stats.failed > 0 && <button className="text-link" disabled={busy(`task:${task.id}`)} onClick={() => void request('retryFailed', { id: task.id }, `task:${task.id}`)}>仅重跑失败</button>}</div>
+  return <main className="canvas"><div className="canvas-h"><span className="title">{task.title || '生成'} · <b>{stats.results.length} 张</b></span>{stats.failed > 0 && <button className="text-link" disabled={busy(`task:${task.id}`)} onClick={() => void request('retryFailed', { id: task.id }, `task:${task.id}`)}>重试失败</button>}</div>
     <div className="canvas-scroll" ref={scrollPanel} onScroll={event => { const node = event.currentTarget; followLatest.current = node.scrollHeight - node.scrollTop - node.clientHeight < 100; }}>
       {stats.unknown > 0 && <div className="warnbox canvas-warning">部分请求结果未知，可能已在供应商生成或计费。不会自动重试，请先核对供应商记录。<button className="text-link" disabled={busy(`task:${task.id}`) || stats.active || stats.queued > 0} onClick={() => setRetryUnknown(true)}>手动重试未知请求</button></div>}
       {(runs.length > 0 || local) && <div className="conversation">
-        {runs.map(({ run, jobs }) => <div className="conversation-turn" key={run}><UserMessage prompt={jobs[0].prompt} referenceIds={jobs[0].referenceIds ?? []} onPreview={setPreview} /><div className="conversation-assistant"><span className="conversation-avatar" aria-hidden="true">✦</span>
-          <div className="imggrid conversation-results">{jobs.flatMap(job => job.results).map(result => <button className="imgcard" key={result.id} aria-label={`预览 ${result.name}`} title="点击预览图片" onClick={() => setPreview({ kind: 'result', id: result.id, name: result.name })}><img src={result.url} alt="" loading="lazy" /></button>)}
+        {runs.map(({ run, jobs }) => <div className="conversation-turn" key={run}><UserMessage prompt={jobs[0].prompt} referenceIds={jobs[0].referenceIds ?? []} onPreview={openPreview} /><div className="conversation-assistant"><span className="conversation-avatar" aria-hidden="true">✦</span>
+          <div className="imggrid conversation-results">{jobs.flatMap(job => job.results).map(result => <button className="imgcard" key={result.id} aria-label={`预览 ${result.name}`} title="点击预览图片" onClick={() => openPreview({ kind: 'result', id: result.id, name: result.name }, resultImages)}><img src={result.url} alt="" loading="lazy" /></button>)}
             {jobs.flatMap(job => Array.from({ length: pendingImageSlots(job) }, (_, index) => ({ job, index }))).map(({ job, index }) => { const paused = task.paused && job.status === 'queued'; return <PendingImage key={`${job.id}:${index}`} run={run} paused={paused} phase={paused ? '队列已暂停' : statusLabels[job.status]} />; })}</div>
           {jobs.filter(job => job.status !== 'completed' && pendingImageSlots(job) === 0).map(job => <div className="job-notice" key={job.id}><Status status={job.status} /><span>{job.error || (activeJob(job) ? '等待服务返回真实结果，请勿重复提交。' : '')}</span></div>)}
         </div></div>)}
-        {local && <div className="conversation-turn"><UserMessage prompt={local.prompt} referenceIds={local.referenceIds} onPreview={setPreview} /><div className="conversation-assistant"><span className="conversation-avatar" aria-hidden="true">✦</span><div className="imggrid conversation-results">{Array.from({ length: localCount }, (_, index) => <PendingImage key={`local:${index}`} run={nextRun} phase="正在提交" />)}</div></div></div>}
+        {local && <div className="conversation-turn"><UserMessage prompt={local.prompt} referenceIds={local.referenceIds} onPreview={openPreview} /><div className="conversation-assistant"><span className="conversation-avatar" aria-hidden="true">✦</span><div className="imggrid conversation-results">{Array.from({ length: localCount }, (_, index) => <PendingImage key={`local:${index}`} run={nextRun} phase="正在提交" />)}</div></div></div>}
       </div>}
       {!task.jobs.length && !localCount && <div className="creation-welcome"><div className="welcome-mark">✦</div><h1>让想象，成为画面</h1><p>描述你的创意，选择模型，即可开始生成。</p></div>}
     </div>
     {retryUnknown && <UnknownRetry task={task} onClose={() => setRetryUnknown(false)} />}
-    {preview && <ImagePreview key={`${preview.kind}:${preview.id}`} image={preview} onClose={() => setPreview(null)} />}
+    {preview && <ImagePreview selection={preview} onMove={direction => setPreview(current => current ? movePreview(current, direction) : null)} onClose={() => setPreview(null)} />}
   </main>;
 }
 
-function ImagePreview({ image, onClose }: { image: PreviewImage; onClose: () => void }) {
+function ImagePreview({ selection, onMove, onClose }: { selection: PreviewSelection; onMove: (direction: -1 | 1) => void; onClose: () => void }) {
   const { request, busy, notify } = useAPI();
   const [failed, setFailed] = useState(false);
+  const image = selection.images[selection.index];
   const copyKey = `copy:${image.kind}:${image.id}`, saveKey = `save:${image.kind}:${image.id}`;
   const copying = busy(copyKey), saving = busy(saveKey);
+  useLayoutEffect(() => { setFailed(false); }, [image.kind, image.id]);
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (copying || saving || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
+      if (event.key === 'ArrowLeft' && selection.index > 0) { event.preventDefault(); onMove(-1); }
+      if (event.key === 'ArrowRight' && selection.index < selection.images.length - 1) { event.preventDefault(); onMove(1); }
+    };
+    document.addEventListener('keydown', keydown);
+    return () => document.removeEventListener('keydown', keydown);
+  }, [copying, saving, selection.index, selection.images.length, onMove]);
   const payload = image.kind === 'result' ? { resultId: image.id } : { referenceId: image.id };
   return <Modal title="图片预览" className="image-preview" onClose={onClose} busy={copying || saving} footer={<>
+    {selection.images.length > 1 && <span className="preview-position" aria-live="polite">{selection.index + 1} / {selection.images.length}</span>}
     <button className="btn" disabled={copying || saving} onClick={() => { void request(image.kind === 'result' ? 'copyResult' : 'copyReference', payload, copyKey).then(value => { if (value === true) notify('图片已复制到剪贴板。'); }); }}>{copying ? '复制中…' : '复制图片'}</button>
     <button className="btn btn--pri" disabled={copying || saving} onClick={() => { void request(image.kind === 'result' ? 'saveResult' : 'saveReference', payload, saveKey).then(value => { if (value !== undefined && value !== false) notify('图片已保存。'); }); }}>{saving ? '保存中…' : '下载图片'}</button>
   </>}>
-    {failed ? <div className="preview-error" role="alert">原图加载失败，请检查图片是否仍然可用。</div> : <img className="preview-image" src={`qingtu-asset://asset/${image.kind}/${encodeURIComponent(image.id)}`} alt={image.name} onError={() => setFailed(true)} />}
+    <div className={`preview-stage ${selection.images.length > 1 ? 'has-navigation' : ''}`}>
+      {selection.images.length > 1 && <button type="button" className="preview-nav preview-nav--previous" aria-label="上一张" disabled={copying || saving || selection.index === 0} onClick={() => onMove(-1)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m15 5-7 7 7 7" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
+      {failed ? <div className="preview-error" role="alert">原图加载失败，请检查图片是否仍然可用。</div> : <img key={`${image.kind}:${image.id}`} className="preview-image" src={`qingtu-asset://asset/${image.kind}/${encodeURIComponent(image.id)}`} alt={image.name} onError={() => setFailed(true)} />}
+      {selection.images.length > 1 && <button type="button" className="preview-nav preview-nav--next" aria-label="下一张" disabled={copying || saving || selection.index === selection.images.length - 1} onClick={() => onMove(1)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m9 5 7 7-7 7" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
+    </div>
   </Modal>;
 }
 
@@ -282,27 +337,34 @@ function UnknownRetry({ task, onClose }: { task: Task; onClose: () => void }) {
 }
 
 function BatchCanvas({ task, drafts }: { task: Task; drafts: DraftStore }) {
-  const { request, busy, notify } = useAPI();
+  const { state, request, busy, notify } = useAPI();
+  const templateReady = Boolean(state?.features?.batchReferencePaths);
+  const referencesById = useMemo(() => new Map((state?.references ?? []).map(reference => [reference.id, reference])), [state?.references]);
   const [clear, setClear] = useState(false);
   const importLock = useRef(false);
   const [importing, setImporting] = useState(false);
   const [retryUnknown, setRetryUnknown] = useState(false);
+  const [preview, setPreview] = useState<PreviewSelection | null>(null);
   const stats = summarizeTask(task);
   const locked = busy(`task:${task.id}`) || importing;
-  const importRows = async () => { if (importLock.current) return; importLock.current = true; setImporting(true); try { await drafts.flush(task.id); await request('importRows', { id: task.id }, `task:${task.id}`); } finally { importLock.current = false; setImporting(false); } };
-  const rows = task.jobs.length ? task.jobs.map(job => ({ id: job.id, row: job.row, prompt: job.prompt, job })) : task.rows.map((prompt, index) => ({ id: `draft-${index}`, row: index + 1, prompt, job: undefined }));
-  return <main className="canvas batch-canvas"><div className="canvas-h"><button className="btn btn--sm" disabled={busy('batch-template')} onClick={() => { void request('downloadBatchTemplate', {}, 'batch-template').then(result => { if (result === true) notify('表格模板已保存。'); }); }}>{busy('batch-template') ? '保存中…' : '下载表格模板'}</button><button className="btn btn--sm" disabled={locked || stats.active || stats.queued > 0} onClick={() => void importRows()}>导入表格</button><span className="title">{task.title} · <b>{task.rows.length} 条</b></span><span className="sp" />
-    <button className="text-link" disabled={locked || (!stats.queued && !stats.active)} onClick={() => void request(task.paused ? 'resumeTask' : 'pauseTask', { id: task.id }, `task:${task.id}`)}>{task.paused ? '继续队列' : '暂停队列'}</button>
-    <button className="text-link" disabled={locked || !stats.failed || stats.active || stats.queued > 0} onClick={() => void request('retryFailed', { id: task.id }, `task:${task.id}`)}>仅重跑失败</button>
+  const importRows = async () => { if (importLock.current || !templateReady) return; importLock.current = true; setImporting(true); try { await drafts.flush(task.id); await request('importRows', { id: task.id }, `task:${task.id}`); } finally { importLock.current = false; setImporting(false); } };
+  const rows = task.jobs.length && !task.rowsPending ? task.jobs.map(job => ({ id: job.id, row: job.row, prompt: job.prompt, referenceId: job.referenceIds?.[0], job })) : task.rows.map((prompt, index) => ({ id: `draft-${index}`, row: index + 1, prompt, referenceId: task.rowReferenceIds?.[index], job: undefined }));
+  return <main className="canvas batch-canvas"><div className="canvas-h"><button className="btn btn--sm" disabled={!templateReady || busy('batch-template')} onClick={() => { void request('downloadBatchTemplate', {}, 'batch-template').then(result => { if (result === true) notify('表格模板已保存。'); }); }}>{busy('batch-template') ? '保存中…' : '下载表格模板'}</button><button className="btn btn--sm" disabled={!templateReady || locked || stats.active || stats.queued > 0} onClick={() => void importRows()}>导入表格</button><span className="title">{task.customTitle || task.title} · <b>{task.rows.length} 条</b></span><span className="sp" />
+    <button className="text-link" disabled={locked || (!stats.queued && !stats.active)} onClick={() => void request(task.paused ? 'resumeTask' : 'pauseTask', { id: task.id }, `task:${task.id}`)}>{task.paused ? '继续任务' : '暂停任务'}</button>
+    <button className="text-link" disabled={locked || !stats.failed || stats.active || stats.queued > 0} onClick={() => void request('retryFailed', { id: task.id }, `task:${task.id}`)}>重试失败</button>
     <button className="text-link danger-text" disabled={locked || stats.active || stats.queued > 0 || (!task.rows.length && !task.jobs.length)} onClick={() => setClear(true)}>清空列表</button></div>
+    {state && !templateReady && <div className="warnbox canvas-warning" role="status">请重启轻图开发版，以启用表格参考图功能。</div>}
     {task.paused && <div className="queue-note">队列已暂停；已发出的请求仍会继续完成。</div>}
     {stats.unknown > 0 && <div className="warnbox canvas-warning">有 {stats.unknown} 项结果未知，可能已产生费用，未自动重跑。请先核对供应商记录。<button className="text-link" disabled={locked || stats.active || stats.queued > 0} onClick={() => setRetryUnknown(true)}>手动重试未知请求</button></div>}
-    {!rows.length ? <Empty title="导入你的批量提示词">下载 Excel 模板，将示例替换为提示词，每行一条。<br />读取第一个工作表的第一列，最多 10,000 条，文件不超过 20 MB。</Empty> : <div className="tbwrap"><table className="tb"><thead><tr><th className="row-number">序号</th><th>提示词</th><th className="result-col">成图</th><th className="status-col">状态</th><th>耗时</th></tr></thead><tbody>{rows.map(({ id, row, prompt, job }) => <tr key={id}>
-      <td className="mono" title={job ? `第 ${job.run} 轮` : undefined}>{String(row).padStart(3, '0')}</td><td className="pt" title={prompt}>{prompt}</td><td><div className="batch-results">{job?.results.map(result => <button key={result.id} className="batch-thumb" aria-label={`放大 ${result.name}`} onClick={() => void request('openResult', { resultId: result.id }, `result:${result.id}`)} disabled={busy(`result:${result.id}`)}><img src={result.url} alt={result.name} loading="lazy" /></button>)}</div></td>
-      <td><Status status={job?.status ?? 'queued'}>{job ? statusLabels[job.status] : '待提交'}</Status>{job?.error && <div className="row-error" title={job.error}>{job.error}</div>}</td><td className="mono">{job?.startedAt && job.endedAt ? `${Math.max(0, (job.endedAt - job.startedAt) / 1000).toFixed(1)}s` : '—'}</td>
-    </tr>)}</tbody></table></div>}
+    {!rows.length ? <Empty title="导入你的批量提示词">下载 Excel 模板，填写提示词和可选的本地参考图路径，每行一条。<br />请替换示例路径；最多 10,000 条，表格不超过 20 MB。</Empty> : <div className="tbwrap"><table className="tb"><colgroup><col className="batch-col-number" /><col className="batch-col-prompt" /><col className="batch-col-reference" /><col className="batch-col-result" /><col className="batch-col-count" /><col className="batch-col-status" /><col className="batch-col-time" /></colgroup><thead><tr><th>序号</th><th>提示词</th><th>参考图</th><th>成图</th><th className="batch-count-heading">数量</th><th>状态</th><th>耗时</th></tr></thead><tbody>{rows.map(({ id, row, prompt, referenceId, job }) => { const reference = referenceId ? referencesById.get(referenceId) : undefined; const results = job?.results ?? []; const cover = results[0]; return <tr key={id}>
+      <td className="mono" title={`第 ${row} 条${job ? ` · 第 ${job.run} 轮` : ''}`}>{String(row).padStart(3, '0')}</td><td className="pt"><span className="batch-prompt-text" title={prompt}>{prompt}</span></td><td>{reference ? <button type="button" className="batch-reference" aria-label={`预览参考图 ${reference.name}`} onClick={() => { const image: PreviewImage = { kind: 'reference', id: reference.id, name: reference.name }; setPreview(selectPreview([image], image)); }}><img src={reference.url} alt="" loading="lazy" /></button> : referenceId ? <span className="row-error">参考图不可用</span> : '—'}</td>
+      <td>{cover && <button type="button" className="batch-thumb" aria-label={`预览本条成图，共 ${results.length} 张`} title={results.length > 1 ? `点击预览，可左右切换 ${results.length} 张成图` : '点击预览图片'} onClick={() => { const images: PreviewImage[] = results.map(result => ({ kind: 'result', id: result.id, name: result.name })); setPreview(selectPreview(images, { kind: 'result', id: cover.id, name: cover.name })); }}><img src={cover.url} alt="" loading="lazy" /></button>}</td>
+      <td className="mono batch-result-count" title={results.length ? `已生成 ${results.length} 张` : '暂无成图'}>{results.length || '—'}</td>
+      <td><Status status={job?.status ?? 'queued'}>{job ? statusLabels[job.status] : '待提交'}</Status>{job?.error && <div className="row-error" title={job.error}>{job.error}</div>}</td><td className="mono" title={job?.startedAt && job.endedAt ? `${Math.max(0, (job.endedAt - job.startedAt) / 1000).toFixed(1)}s` : undefined}>{job?.startedAt && job.endedAt ? `${Math.max(0, (job.endedAt - job.startedAt) / 1000).toFixed(1)}s` : '—'}</td>
+    </tr>; })}</tbody></table></div>}
     {retryUnknown && <UnknownRetry task={task} onClose={() => setRetryUnknown(false)} />}
     {clear && <Confirm title="清空批量列表" onClose={() => setClear(false)} busy={locked} onConfirm={() => { void request('clearTask', { id: task.id }, `task:${task.id}`).then(result => { if (result !== undefined) setClear(false); }); }}>确定清空此任务的导入列表和任务记录吗？已导出的文件不会因此删除。</Confirm>}
+    {preview && <ImagePreview selection={preview} onMove={direction => setPreview(current => current ? movePreview(current, direction) : null)} onClose={() => setPreview(null)} />}
   </main>;
 }
 
@@ -360,7 +422,7 @@ function TaskEditor({ task, drafts, onSubmissionChange }: { task: Task; drafts: 
   const model = choice?.model;
   const references = task.referenceIds.flatMap((id, position) => { const ref = state?.references.find(item => item.id === id); return ref ? [{ ...ref, position }] : []; });
   const referenceLimit = model?.reference ? Math.min(8, model.maxReferences) : 0;
-  const invalidReferences = task.referenceIds.length > referenceLimit;
+  const invalidReferences = task.kind === 'batch' ? Boolean(task.rowReferenceIds?.some(Boolean) && (!model?.reference || model.maxReferences < 1)) : task.referenceIds.length > referenceLimit;
   const stats = summarizeTask(task);
   const locked = busy(`task:${task.id}`) || submitting;
   const edit = (patch: Partial<Draft>) => { const current = draftRef.current; const currentChoice = selectedImageModel(choices, current.params); const next = { ...current, params: normalizeParams(current.params, currentChoice), ...patch }; draftRef.current = next; setDraft(next); drafts.change(task.id, next); };
@@ -470,6 +532,7 @@ function TaskEditor({ task, drafts, onSubmissionChange }: { task: Task; drafts: 
     <div className="sec-box"><div className="frow"><label htmlFor="model">模型</label><Select id="model" value={choice?.value ?? ''} disabled={locked || !choices.length} options={[...(!choice ? [{ value: '', label: choices.length ? '请选择模型' : '暂无启用的生图模型', disabled: true }] : []), ...choices.map(option => ({ value: option.value, label: `${option.model.name || option.model.id} · ${option.provider.name}` }))]} onChange={value => { const next = choices.find(option => option.value === value); edit({ params: normalizeParams(params, next) }); }} /></div>
       {choice && !choice.provider.hasKey && <p className="inline-error model-hint">请先在供应商设置中填写 API Key。</p>}
       {model && !model.verified && <p className="hinttxt model-hint">预置候选模型，尚未通过连接测试验证。</p>}
+      {invalidReferences && <p className="inline-error">表格包含参考图，请选择支持参考图的模型。</p>}
       <div className="frow"><label htmlFor="quality">质量</label><Select id="quality" value={params.quality} disabled={locked || !model?.qualities.length} options={!model?.qualities.length ? [{ value: '', label: '由模型决定' }] : model.qualities.map(quality => ({ value: quality, label: { auto: '自动', low: '低', medium: '中', high: '高', standard: '标准', hd: '高清' }[quality] ?? quality }))} onChange={quality => setParams({ quality })} /></div>
       <div className="frow"><label htmlFor="size">分辨率</label><Select id="size" value={params.size} disabled={locked || !model?.sizes.length} options={!model?.sizes.length ? [{ value: '', label: '由模型决定' }] : model.sizes.map(size => ({ value: size, label: size === 'auto' ? '自动' : `${size.replace(/x/i, ' × ')}（${aspectRatio(size)}）` }))} onChange={size => setParams({ size })} /></div>
       <div className="frow"><label>比例</label><div className="ratio-chips">{[...new Set((model?.sizes ?? []).map(aspectRatio))].map(ratio => <button className={`chip ${aspectRatio(params.size) === ratio ? 'on' : ''}`} key={ratio} aria-pressed={aspectRatio(params.size) === ratio} disabled={locked} onClick={() => { const size = model?.sizes.find(value => aspectRatio(value) === ratio); if (size) setParams({ size }); }}>{ratio}</button>)}{!model?.sizes.length && <span className="hinttxt">由模型决定</span>}</div></div>
@@ -535,20 +598,45 @@ function Basic() {
   const dirty = useRef(false);
   const textChoices = textModelChoices(state?.providers ?? []);
   const textChoice = textChoices.find(option => option.provider.id === settings.textProviderId && option.model.id === settings.textModel);
+  const namingMode = presetNamingMode(settings.namingMode, settings.naming);
+  const organizationReady = Boolean(state?.features?.outputOrganization);
+  const nameExample = outputName({ naming: settings.naming ?? '{序号}_{日期}', namingMode, sequence: 1, row: 1, index: 1, run: 1, createdAt: Date.now() }).base;
   useEffect(() => { if (!dirty.current && state) setSettings(state.settings); }, [state?.settings]);
   const edit = (patch: Partial<Settings>) => { dirty.current = true; setSettings(current => ({ ...current, ...patch })); };
-  const save = async () => { const result = await request('saveSettings', { ...settings }, 'settings:save'); if (result !== undefined) { dirty.current = false; notify('设置已保存。'); } };
-  return <section className="set-wrap"><div className="set-hd"><h2>基础设置</h2><button className="btn btn--pri" disabled={!online || !state || busy('settings:save') || busy('settings:directory')} onClick={() => void save()}>{busy('settings:save') ? '保存中…' : '保存设置'}</button></div><div className="card output-card"><h3>输出</h3><div className="frow"><label htmlFor="default-directory">默认保存目录</label><div className="directory-input"><input id="default-directory" className="ipt ipt--mono" value={settings.outputDirectory} disabled={!state || busy('settings:save')} placeholder="选择保存目录" onChange={event => edit({ outputDirectory: event.target.value })} /><button className="btn btn--sm" aria-label="选择默认保存目录" disabled={!state || busy('settings:save') || busy('settings:directory')} onClick={() => { void request('chooseOutputDirectory', {}, 'settings:directory').then(result => { if (typeof result === 'string') edit({ outputDirectory: result }); }); }}>…</button></div><p className="hinttxt">生成和批量任务使用此目录，已提交的任务保持原设置。</p></div><div className="frow"><label htmlFor="default-naming">文件命名</label><input id="default-naming" className="ipt ipt--mono" value={settings.naming ?? '{序号}_{日期}'} maxLength={100} disabled={!state || busy('settings:save')} onChange={event => edit({ naming: event.target.value })} /><p className="hinttxt">支持 {'{序号}'} 和 {'{日期}'}；已提交的任务保持原设置。</p></div><div className="frow"><label htmlFor="format">默认格式</label><Select id="format" value={settings.format} disabled={!state || busy('settings:save')} options={[{ value: 'png', label: 'PNG' }, { value: 'jpg', label: 'JPG' }, { value: 'webp', label: 'WebP' }]} onChange={value => edit({ format: value as Settings['format'] })} /></div><div className="frow"><label htmlFor="text-model">默认文本模型</label><Select id="text-model" value={textSelectionValue(textChoices, settings.textProviderId, settings.textModel)} disabled={!state || busy('settings:save')} options={[{ value: '', label: '未配置' }, ...(!textChoice && (settings.textProviderId || settings.textModel) ? [{ value: '__missing__', label: '原文本模型已停用，请重新选择', disabled: true }] : []), ...textChoices.map(option => ({ value: option.value, label: `${option.model.name || option.model.id} · ${option.provider.name}` }))]} onChange={value => { const selected = textChoices.find(option => option.value === value); edit({ textProviderId: selected?.provider.id ?? '', textModel: selected?.model.id ?? '' }); }} /><p className="hinttxt text-model-hint">用于提示词优化与中译英。{!textChoice ? '请先在供应商中启用文本模型，再选择并保存。' : !textChoice.model.verified ? '当前为预置候选，仍需测试连接验证。' : ''}</p></div></div></section>;
+  const save = async () => { const result = await request('saveSettings', { ...settings, namingMode, naming: NAMING_PRESETS[namingMode] }, 'settings:save'); if (result !== undefined) { dirty.current = false; notify('设置已保存。'); } };
+  return <section className="set-wrap preferences-page"><div className="preferences-content">
+    <header className="preferences-heading"><div><h2>基础设置</h2></div><button className="btn btn--pri" disabled={!online || !state || busy('settings:save') || busy('settings:directory')} onClick={() => void save()}>{busy('settings:save') ? '保存中…' : '保存设置'}</button></header>
+    <div className="preferences-sections">
+      {state && !organizationReady && <div className="warnbox" role="status">重启轻图后可使用新的命名方式与集中保存功能。</div>}
+      <section className="card settings-card" aria-labelledby="output-settings-heading"><div className="settings-section-heading"><h3 id="output-settings-heading">图片保存</h3><p>保存后对新提交的任务生效。</p></div>
+        <div className="settings-field"><label htmlFor="default-directory">默认保存目录</label><div className="settings-control"><div className="directory-input"><input id="default-directory" className="ipt ipt--mono" value={settings.outputDirectory} disabled={!state || busy('settings:save')} placeholder="选择保存目录" readOnly title={settings.outputDirectory || undefined} /><button className="btn btn--sm" aria-label="选择默认保存目录" disabled={!state || busy('settings:save') || busy('settings:directory')} onClick={() => { void request('chooseOutputDirectory', {}, 'settings:directory').then(result => { if (typeof result === 'string') edit({ outputDirectory: result }); }); }}>选择目录</button></div></div></div>
+        <div className="settings-field"><label htmlFor="naming-mode">文件命名</label><div className="settings-control"><Select id="naming-mode" value={namingMode} disabled={!organizationReady || busy('settings:save')} options={[{ value: 'sequence', label: '按序号' }, { value: 'date', label: '按日期' }, { value: 'date-sequence', label: '日期加序号' }]} onChange={value => { const mode = value as keyof typeof NAMING_PRESETS; edit({ namingMode: mode, naming: NAMING_PRESETS[mode] }); }} /><p className="hinttxt naming-example" title="同名文件自动编号，不会覆盖已有图片。">示例：<span className="mono">{nameExample}.{settings.format}</span></p></div></div>
+        <div className="settings-field"><label htmlFor="output-layout">保存方式</label><div className="settings-control"><Select id="output-layout" value={settings.outputLayout ?? 'grouped'} disabled={!organizationReady || busy('settings:save')} options={[{ value: 'grouped', label: '按任务分文件夹' }, { value: 'flat', label: '全部保存到同一文件夹' }]} onChange={value => edit({ outputLayout: value as OutputLayout })} /></div></div>
+        <div className="settings-field"><label htmlFor="format">默认格式</label><div className="settings-control settings-control--short"><Select id="format" value={settings.format} disabled={!state || busy('settings:save')} options={[{ value: 'png', label: 'PNG' }, { value: 'jpg', label: 'JPG' }, { value: 'webp', label: 'WebP' }]} onChange={value => edit({ format: value as Settings['format'] })} /></div></div>
+      </section>
+      <section className="card settings-card" aria-labelledby="text-settings-heading"><div className="settings-section-heading"><h3 id="text-settings-heading">提示词辅助</h3></div><div className="settings-field"><label htmlFor="text-model" title="用于提示词优化和中译英">默认文本模型</label><div className="settings-control"><Select id="text-model" value={textSelectionValue(textChoices, settings.textProviderId, settings.textModel)} disabled={!state || busy('settings:save')} options={[{ value: '', label: '未配置' }, ...(!textChoice && (settings.textProviderId || settings.textModel) ? [{ value: '__missing__', label: '原文本模型已停用，请重新选择', disabled: true }] : []), ...textChoices.map(option => ({ value: option.value, label: `${option.model.name || option.model.id} · ${option.provider.name}` }))]} onChange={value => { const selected = textChoices.find(option => option.value === value); edit({ textProviderId: selected?.provider.id ?? '', textModel: selected?.model.id ?? '' }); }} />{(!textChoice || !textChoice.model.verified) && <p className="hinttxt">{!textChoice ? '请选择文本模型以启用提示词优化和中译英。' : '此模型尚未验证，请先测试供应商连接。'}</p>}</div></div></section>
+    </div>
+  </div></section>;
 }
 function About() {
   const { state, request, online, busy } = useAPI();
   const [update, setUpdate] = useState('尚未检查更新');
   const check = async () => { setUpdate('正在检查…'); const result = await request('checkUpdate'); setUpdate(typeof result === 'string' ? result : result && typeof result === 'object' && 'message' in result ? String(result.message) : result === undefined ? '检查未完成，请查看错误提示' : '检查完成，请查看通知'); };
-  return <section className="about-wrap"><h2>关于轻图</h2><div className="card about-card"><div className="about-brand"><div className="logo">轻</div><div><div className="name">轻图 QingTu</div><div className="ver">桌面生图工具{state?.version ? ` · v${state.version}` : ''}</div></div></div><div className="rowline"><div className="grow"><div className="name">GitHub 仓库</div><div className="meta">项目源码与版本信息</div></div><button className="btn btn--sm" disabled={!online} onClick={() => void request('openLink', { name: 'github' })}>打开</button></div><div className="rowline"><div className="grow"><div className="name">检查更新</div><div className="meta" role="status">{update}</div></div><button className="btn btn--sm" disabled={!online || busy('checkUpdate')} onClick={() => void check()}>{busy('checkUpdate') ? '检查中…' : '检查'}</button></div><div className="rowline"><div className="grow"><div className="name">帮助文档</div><div className="meta">使用指南与常见问题</div></div><button className="btn btn--sm" disabled={!online} onClick={() => void request('openLink', { name: 'help' })}>查看</button></div></div></section>;
+  return <section className="about-wrap preferences-page"><div className="preferences-content">
+    <header className="preferences-heading"><div><h2>关于轻图</h2></div></header>
+    <div className="preferences-sections">
+      <div className="card about-overview"><div className="about-brand"><div className="logo" aria-hidden="true">轻</div><div><div className="name">轻图 QingTu</div><div className="ver">桌面生图工具 · 单图创作与批量生成</div></div></div><div className="about-version"><span>当前版本</span><b>{state?.version ? `v${state.version}` : '—'}</b></div></div>
+      <section className="card about-resources" aria-labelledby="about-resources-heading"><div className="settings-section-heading"><h3 id="about-resources-heading">项目与支持</h3></div>
+        <div className="rowline"><div className="grow"><div className="name">GitHub 仓库</div></div><button className="btn btn--sm" disabled={!online} onClick={() => void request('openLink', { name: 'github' })}>打开仓库</button></div>
+        {PRODUCT.updateManifest && <div className="rowline"><div className="grow"><div className="name">版本更新</div><div className="meta" role="status">{update}</div></div><button className="btn btn--sm" disabled={!online || busy('checkUpdate')} onClick={() => void check()}>{busy('checkUpdate') ? '检查中…' : '检查更新'}</button></div>}
+        {PRODUCT.links.help && <div className="rowline"><div className="grow"><div className="name">帮助文档</div></div><button className="btn btn--sm" disabled={!online} onClick={() => void request('openLink', { name: 'help' })}>查看帮助</button></div>}
+      </section>
+    </div>
+  </div></section>;
 }
 
 export default function App() {
-  const { api, notice, dismiss } = useBridge();
+  const { api, notice } = useBridge();
   const [page, setPage] = useState<Page>('gen');
   const [selected, setSelected] = useState<Partial<Record<TaskKind, string>>>({});
   const [localSubmission, setLocalSubmission] = useState<LocalSubmission | null>(null);
@@ -611,6 +699,7 @@ export default function App() {
   const allJobs = api.state?.tasks.flatMap(item => item.jobs) ?? [];
   const active = allJobs.filter(activeJob).length;
   const queued = allJobs.filter(job => job.status === 'queued').length;
+  const quotaProvider = page === 'gen' || page === 'batch' ? api.state?.providers.find(item => item.id === task?.params.providerId) : api.state?.providers.find(item => item.builtin) ?? api.state?.providers[0];
   const closeLock = useRef(false);
   const close = async () => {
     if (closeLock.current) return; closeLock.current = true;
@@ -625,11 +714,11 @@ export default function App() {
       await api.request('windowClose');
     } finally { closeLock.current = false; }
   };
-  return <APIContext.Provider value={api}><div className="app"><header className="titlebar"><div className="logo">轻</div><div className="brand"><b>轻图 QingTu</b><span>桌面生图工具{api.state?.version ? ` v${api.state.version}` : ''}</span></div><div className="tb-right"><button className="tb-link" disabled={!api.online} onClick={() => void api.request('openLink', { name: 'help' })}>帮助</button><button className="tb-link" disabled={!api.online} onClick={() => void api.request('openLink', { name: 'github' })}>GitHub</button><button className="wbtn" aria-label="最小化窗口" disabled={!api.online} onClick={() => void api.request('windowMinimize')}>─</button><button className="wbtn" aria-label="最大化或还原窗口" disabled={!api.online} onClick={() => void api.request('windowMaximize')}>▢</button><button className="wbtn close" aria-label="关闭窗口" disabled={!api.online} onClick={() => void close()}>✕</button></div></header>
+  return <APIContext.Provider value={api}><div className="app"><header className="titlebar"><div className="logo">轻</div><div className="brand"><b>轻图 QingTu</b><span>桌面生图工具{api.state?.version ? ` v${api.state.version}` : ''}</span></div><div className="tb-right">{PRODUCT.links.help && <button className="tb-link" disabled={!api.online} onClick={() => void api.request('openLink', { name: 'help' })}>帮助</button>}<button className="tb-link" disabled={!api.online} onClick={() => void api.request('openLink', { name: 'github' })}>GitHub</button><button className="wbtn" aria-label="最小化窗口" disabled={!api.online} onClick={() => void api.request('windowMinimize')}>─</button><button className="wbtn" aria-label="最大化或还原窗口" disabled={!api.online} onClick={() => void api.request('windowMaximize')}>▢</button><button className="wbtn close" aria-label="关闭窗口" disabled={!api.online} onClick={() => void close()}>✕</button></div></header>
     {!api.online && <div className="connection-banner" role="alert">未连接桌面服务 — 当前页面不是可运行的轻图桌面程序，不会显示模拟任务或发送生图请求。</div>}
     {api.online && !api.state && <div className="connection-banner" role="status">正在读取本地数据… <button className="text-link" disabled={api.busy('getState')} onClick={() => void api.request('getState')}>重新连接</button></div>}
-    <div className="body"><Sidebar page={page} setPage={setPage} /><div className="stage">{page === 'gen' || page === 'batch' ? <div className={`work ${kind === 'single' ? 'single-work' : ''}`}><TaskList key={kind} kind={kind} selected={task?.id} select={id => selectTask(kind, id)} deleteTask={deleteTask} startNew={() => { selectionRevision.current[kind] = (selectionRevision.current[kind] ?? 0) + 1; void prepareDraft(kind); }} />{task ? kind === 'single' ? <div className="single-workspace"><ResultCanvas key={`result:${task.id}`} task={task} localSubmission={localSubmission} /><TaskEditor key={`editor:${task.id}`} task={task} drafts={drafts} onSubmissionChange={value => setLocalSubmission(current => value ?? (current?.taskId === task.id ? null : current))} /></div> : <><BatchCanvas key={`batch:${task.id}`} task={task} drafts={drafts} /><TaskEditor key={`editor:${task.id}`} task={task} drafts={drafts} /></> : <main className="canvas"><Empty title={!api.online ? '未连接桌面服务' : !api.state || api.busy(`create:${kind}`) ? '正在准备创作界面' : '无法准备新任务'}>{!api.online ? '请启动轻图桌面程序，连接本地数据与供应商服务。' : !api.state || api.busy(`create:${kind}`) ? '请稍候。' : '请查看提示，或点击左侧新建任务重试。'}</Empty></main>}</div> : page === 'providers' ? <Providers /> : page === 'settings' ? <Basic /> : <About />}</div></div>
-    <footer className="taskbar"><span className={`dot ${active ? 'run' : ''} ${!api.online ? 'offline' : ''}`} /><span>{!api.online ? '未连接' : !api.state ? '正在连接' : active ? `进行中 · ${active} 项请求${queued ? ` · 排队 ${queued} 项` : ''}` : queued ? `等待队列 · ${queued} 项` : '就绪'}</span><span className="sp" /><span>剩余额度 · {api.state?.quota || '暂不可查询'}</span></footer>
-    {notice && createPortal(<div className={`toast ${notice.error ? 'toast-error' : ''}`} role={notice.error ? 'alert' : 'status'}><span>{notice.message}</span><button aria-label="关闭提示" onClick={dismiss}>✕</button></div>, document.body)}
+    <div className="body"><Sidebar page={page} setPage={setPage} /><div className="stage">{page === 'gen' || page === 'batch' ? <div className={`work ${kind === 'single' ? 'single-work' : 'batch-work'}`}><TaskList key={kind} kind={kind} selected={task?.id} select={id => selectTask(kind, id)} deleteTask={deleteTask} startNew={() => { selectionRevision.current[kind] = (selectionRevision.current[kind] ?? 0) + 1; void prepareDraft(kind); }} />{task ? kind === 'single' ? <div className="single-workspace"><ResultCanvas key={`result:${task.id}`} task={task} localSubmission={localSubmission} /><TaskEditor key={`editor:${task.id}`} task={task} drafts={drafts} onSubmissionChange={value => setLocalSubmission(current => value ?? (current?.taskId === task.id ? null : current))} /></div> : <><BatchCanvas key={`batch:${task.id}`} task={task} drafts={drafts} /><TaskEditor key={`editor:${task.id}`} task={task} drafts={drafts} /></> : <main className="canvas"><Empty title={!api.online ? '未连接桌面服务' : !api.state || api.busy(`create:${kind}`) ? '正在准备创作界面' : '无法准备新任务'}>{!api.online ? '请启动轻图桌面程序，连接本地数据与供应商服务。' : !api.state || api.busy(`create:${kind}`) ? '请稍候。' : '请查看提示，或点击左侧新建任务重试。'}</Empty></main>}</div> : page === 'providers' ? <Providers /> : page === 'settings' ? <Basic /> : <About />}</div></div>
+    <footer className="taskbar"><span className={`dot ${active ? 'run' : ''} ${!api.online ? 'offline' : ''}`} /><span className="taskbar-status">{!api.online ? '未连接' : !api.state ? '正在连接' : active ? `进行中 · ${active} 项请求${queued ? ` · 排队 ${queued} 项` : ''}` : queued ? `等待队列 · ${queued} 项` : '就绪'}</span><span className="sp" /><QuotaStatus key={`${quotaProvider?.id}:${quotaProvider?.baseURL}:${quotaProvider?.configurationRevision}:${quotaProvider?.hasKey}`} provider={quotaProvider} /></footer>
+    {notice && createPortal(<div className={`toast ${notice.error ? 'toast-error' : ''}`} role={notice.error ? 'alert' : 'status'}>{notice.message}</div>, document.body)}
   </div></APIContext.Provider>;
 }

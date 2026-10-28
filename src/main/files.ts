@@ -6,14 +6,14 @@ import { request as httpsRequest } from 'node:https';
 import { isIP } from 'node:net';
 import { inflateRawSync } from 'node:zlib';
 import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
 import ExcelJS from 'exceljs';
-import type { Reference, ResultImage } from '../shared/types';
+import type { NamingMode, OutputLayout, Reference, ResultImage } from '../shared/types';
+import { localOutputDate, outputName } from '../shared/output-naming';
 import type { ImageFormat, ImageOutput } from './image-worker';
 
 export function localDateStamp(timestamp: number): string {
-  const date = new Date(timestamp);
-  if (!Number.isFinite(date.getTime())) throw new Error('任务时间无效');
-  return `${date.getFullYear()}${String(date.getMonth()+1).padStart(2,'0')}${String(date.getDate()).padStart(2,'0')}`;
+  return localOutputDate(timestamp);
 }
 
 const MB = 1024 * 1024;
@@ -27,7 +27,7 @@ const MANIFEST_NAME = 'assets.json';
 
 export interface ProviderImage { bytes?: Uint8Array; url?: string; mime?: string }
 export interface StoredImage { id: string; url?: string; path?: string; mime?: string }
-export interface OutputContext { taskId: string; taskKind: 'single' | 'batch'; jobId: string; run: number; row: number; index: number; outputDirectory: string; naming: string; format: ImageFormat; createdAt: number }
+export interface OutputContext { taskId: string; taskKind: 'single' | 'batch'; jobId: string; run: number; row: number; index: number; outputDirectory: string; naming: string; namingMode?: NamingMode; outputLayout?: OutputLayout; sequence?: number; format: ImageFormat; createdAt: number }
 interface AssetRecord {
   id: string; kind: 'reference' | 'result'; name: string; file?: string; thumbnail?: string; mime?: string;
   size: number; sourceURL?: string; outputPath?: string; context?: OutputContext; stageCount?: number;
@@ -110,12 +110,13 @@ export function validateXlsxArchive(bytes: Buffer): void {
 }
 
 export const BATCH_TEMPLATE_EXAMPLE = '一只戴着围巾的橘猫坐在窗边，柔和的自然光，细节清晰';
+export interface BatchSheetRow { prompt: string; referencePath: string; sourceRow: number }
 export async function createBatchTemplate(): Promise<Buffer> {
   const workbook = new ExcelJS.Workbook();
   const worksheet = workbook.addWorksheet('批量提示词', { views: [{ state: 'frozen', ySplit: 1 }] });
-  worksheet.columns = [{ width: 76 }];
-  worksheet.addRow(['提示词']);
-  worksheet.addRow([BATCH_TEMPLATE_EXAMPLE]);
+  worksheet.columns = [{ width: 76 }, { width: 60 }];
+  worksheet.addRow(['提示词', '参考图路径（可选）']);
+  worksheet.addRow([BATCH_TEMPLATE_EXAMPLE, 'D:\\图片\\参考图.png']);
   worksheet.getRow(1).height = 25;
   worksheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
   worksheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF415CB6' } };
@@ -125,23 +126,43 @@ export async function createBatchTemplate(): Promise<Buffer> {
   return Buffer.from(await workbook.xlsx.writeBuffer());
 }
 
-export async function parseXlsxRows(bytes: Buffer): Promise<string[]> {
+export async function parseXlsxRows(bytes: Buffer): Promise<BatchSheetRow[]> {
   if (bytes.length > MAX_IMPORT_BYTES) fail('文件超过大小限制');
   validateXlsxArchive(bytes);
   const workbook = new ExcelJS.Workbook();
   try { await workbook.xlsx.load(bytes as any, { ignoreNodes: ['drawing','extLst','picture'] }); } catch { return fail('无法读取 XLSX 工作簿'); }
   const worksheet = workbook.worksheets[0]; if (!worksheet) fail('工作簿没有工作表');
-  const rows: string[] = [];
-  worksheet.eachRow({ includeEmpty: false }, row => {
-    const cell = row.getCell(1), value = cell.value;
-    if (value && typeof value === 'object' && ('formula' in value || 'sharedFormula' in value)) fail('首列包含公式，请先粘贴为纯文本再导入');
-    const text = cell.text.trim(); if (text) rows.push(text);
-    if (rows.length > MAX_ROWS + 1) fail('最多导入 10000 行提示词');
+  const rows: BatchSheetRow[] = [];
+  let first = true;
+  worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+    const promptCell = row.getCell(1), pathCell = row.getCell(2);
+    for (const cell of [promptCell, pathCell]) { const value = cell.value; if (value && typeof value === 'object' && ('formula' in value || 'sharedFormula' in value)) fail(`第 ${rowNumber} 行包含公式，请先粘贴为纯文本再导入`); }
+    const prompt = promptCell.text.trim();
+    const value = pathCell.value;
+    const referencePath = (value && typeof value === 'object' && 'hyperlink' in value ? value.hyperlink : pathCell.text).trim();
+    if (first && (prompt === '提示词' || prompt.toLowerCase() === 'prompt')) { first = false; return; }
+    if (!prompt && !referencePath) return;
+    first = false;
+    if (!prompt) fail(`第 ${rowNumber} 行缺少提示词`);
+    rows.push({ prompt, referencePath, sourceRow: rowNumber });
+    if (rows.length > MAX_ROWS) fail('最多导入 10000 行提示词');
   });
-  if (rows[0] === '提示词' || rows[0]?.toLowerCase() === 'prompt') rows.shift();
-  if (rows.length > MAX_ROWS) fail('最多导入 10000 行提示词');
   if (!rows.length) fail('没有可导入的提示词');
   return rows;
+}
+
+export function resolveBatchReferencePath(value: string, workbookPath: string): string {
+  let input = value.trim();
+  if (input.startsWith('"') && input.endsWith('"')) input = input.slice(1, -1).trim();
+  if (!input || /[\x00-\x1f]/.test(input)) fail('参考图路径无效');
+  if (/^file:/i.test(input)) {
+    try { const url = new URL(input); if ((url.hostname && url.hostname !== 'localhost') || url.search || url.hash) fail('参考图必须是本地文件'); input = fileURLToPath(url); }
+    catch { return fail('参考图链接无效，请填写本地图片路径'); }
+  } else if (/^[a-z][a-z0-9+.-]*:/i.test(input) && !/^[a-z]:[\\/]/i.test(input)) fail('参考图必须是本地文件');
+  if (/^(\\\\|\/\/)/.test(input)) fail('参考图必须是本地文件');
+  const resolved = path.resolve(path.dirname(workbookPath), input);
+  if (!['.png', '.jpg', '.jpeg', '.webp'].includes(path.extname(resolved).toLowerCase())) fail('参考图仅支持 PNG、JPG、JPEG 或 WebP');
+  return resolved;
 }
 
 export function isPublicAddress(address: string): boolean {
@@ -209,6 +230,7 @@ export function validateNaming(naming: string): string {
 }
 function validateContext(context: OutputContext): void {
   validId(context.taskId); validId(context.jobId); validateNaming(context.naming);
+  if (context.namingMode !== undefined && !['sequence', 'date', 'date-sequence', 'custom'].includes(context.namingMode) || context.outputLayout !== undefined && !['grouped', 'flat'].includes(context.outputLayout) || context.sequence !== undefined && (!Number.isSafeInteger(context.sequence) || context.sequence < 1 || context.sequence > 100_000_000)) fail('图片保存方式无效');
   if (!['png','jpg','webp'].includes(context.format) || !['single','batch'].includes(context.taskKind) || (!Number.isSafeInteger(context.createdAt) || context.createdAt < 0 || context.createdAt > 8_640_000_000_000_000) || ![context.row,context.run,context.index].every(x => Number.isSafeInteger(x) && x > 0 && x <= 100_000_000)) fail('图片输出参数无效');
 }
 
@@ -280,7 +302,7 @@ export class FileService {
         const temp = path.join(path.dirname(target), `manifest-${randomUUID()}.tmp`);
         const handle = await fs.open(temp, 'wx', 0o600);
         try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
-        try { await fs.rename(temp, target); } finally { await fs.rm(temp, { force: true }).catch(() => {}); }
+        await fs.rename(temp, target);
       };
       // A shard contains one whole generation response (or one reference), so large batches do not
       // repeatedly rewrite an ever-growing monolithic manifest and each staged response commits atomically.
@@ -298,7 +320,7 @@ export class FileService {
     const real = await fs.realpath(directory); if (!(await fs.stat(real)).isDirectory()) fail('请选择有效的保存文件夹');
     this.directories.add(real); await this.persist(); return real;
   }
-  async importRows(filename: string): Promise<string[]> {
+  async importRows(filename: string): Promise<BatchSheetRow[]> {
     const extension = path.extname(filename).toLowerCase();
     if (extension !== '.xlsx') fail('仅支持 XLSX 表格文件');
     return parseXlsxRows(await readBounded(filename, MAX_IMPORT_BYTES));
@@ -354,7 +376,7 @@ export class FileService {
         for (const asset of imported) this.putAsset(asset);
         await this.persist(imported); return imported.map(asset => ({ id: asset.id, name: asset.name, url: assetURL(asset.id) }));
       } catch (error) {
-        for (const asset of imported) { this.deleteAsset(asset); await fs.rm(this.managedPath(asset.file!), { force: true }).catch(() => {}); await fs.rm(this.managedPath(asset.thumbnail!), { force: true }).catch(() => {}); }
+        for (const asset of imported) this.deleteAsset(asset);
         throw error;
       }
     };
@@ -470,10 +492,8 @@ export class FileService {
     await this.persist([asset]);
     if (context.outputDirectory) {
       const directory = await this.outputDirectory(context);
-      const date = localDateStamp(context.createdAt);
-      const base = context.naming.replace(/\{序号\}/g, `${String(context.row).padStart(4,'0')}-${String(context.index).padStart(2,'0')}`).replace(/\{日期\}/g, date);
-      const name = safeBasename(`${base}_run-${context.run}_row-${context.row}_image-${context.index}`);
-      asset.outputPath = await this.atomicOutput(directory, `${name}.${context.format}`, converted.bytes);
+      const name = safeBasename(outputName(context).base);
+      asset.outputPath = await this.atomicOutput(directory, `${name}.${context.format}`, converted.bytes, false, context);
       asset.name = path.basename(asset.outputPath); await this.persist([asset]);
     } else { asset.name = `图片-${context.row}-${context.index}.${context.format}`; await this.persist([asset]); }
     return this.resultDTO(asset);
@@ -491,6 +511,7 @@ export class FileService {
   private async outputDirectory(context: OutputContext): Promise<string> {
     const root = await fs.realpath(context.outputDirectory);
     if (!this.directories.has(root)) fail('请通过选择文件夹按钮授权保存位置');
+    if (context.outputLayout === 'flat') return root;
     let target = root;
     for (const component of [context.taskKind === 'batch' ? '批量任务' : '单图任务', context.taskId, `run-${context.run}`]) {
       target = path.join(target, component); await fs.mkdir(target, { recursive: false }).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error; });
@@ -500,13 +521,15 @@ export class FileService {
     return target;
   }
   /** A fully-written temporary inode is linked into place; existing destinations are never overwritten. */
-  private async atomicOutput(directory: string, desired: string, bytes: Uint8Array, exact = false): Promise<string> {
+  private async atomicOutput(directory: string, desired: string, bytes: Uint8Array, exact = false, context?: OutputContext): Promise<string> {
     const temporary = path.join(directory, `.qingtu-${randomUUID()}.tmp`), handle = await fs.open(temporary, 'wx', 0o600);
     try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
     try {
       const extension = path.extname(desired), base = desired.slice(0, -extension.length);
-      for (let suffix = 0; suffix < 10_000; suffix++) {
-        const target = path.join(directory, suffix ? `${base}_${suffix}${extension}` : desired);
+      let offset = 0;
+      for (let attempt = 0; attempt < 10_000; attempt++, offset++) {
+        const candidate = context ? `${safeBasename(outputName(context, offset).base)}${extension}` : offset ? `${base}_${offset}${extension}` : desired;
+        const target = path.join(directory, candidate);
         try {
           try { await (this.options.link ?? fs.link)(temporary, target); }
           catch (error: any) {
@@ -519,7 +542,21 @@ export class FileService {
             await final.close();
           }
           return target;
-        } catch (error: any) { if (error.code !== 'EEXIST') throw error; if (exact) fail('文件已存在，请更换名称以免覆盖图片'); }
+        } catch (error: any) {
+          if (error.code !== 'EEXIST') throw error;
+          if (exact) fail('文件已存在，请更换名称以免覆盖图片');
+          const sequential = context && outputName(context).sequence;
+          if (attempt === 0 && sequential) {
+            // Skip existing numbering in one directory read, including large batches.
+            let maximum = sequential.value;
+            for (const name of await fs.readdir(directory)) {
+              if (path.extname(name).toLowerCase() !== extension.toLowerCase() || !name.startsWith(sequential.prefix)) continue;
+              const number = name.slice(sequential.prefix.length, -extension.length);
+              if (/^\d+$/.test(number) && Number.isSafeInteger(Number(number))) maximum = Math.max(maximum, Number(number));
+            }
+            offset = Math.max(offset, maximum - sequential.value);
+          }
+        }
       }
       return fail('同名文件过多，请更改命名模板');
     } finally { await fs.rm(temporary, { force: true }); }

@@ -22,11 +22,11 @@ test('only XLSX files are accepted for bulk import', async () => {
   await assert.rejects(files.importRows('prompts.csv'), /仅支持 XLSX/);
 });
 
-test('XLSX uses first worksheet/column only and rejects formula cells', async () => {
+test('XLSX uses the first worksheet and rejects formula cells', async () => {
   const { dir, files } = await fixture(); const filename = path.join(dir,'rows.xlsx');
   const workbook = new ExcelJS.Workbook(); const sheet = workbook.addWorksheet('first');
   sheet.addRows([['prompt','ignored'],['same','ignore this'],[],['same'],['last']]); workbook.addWorksheet('second').addRow(['not imported']);
-  await workbook.xlsx.writeFile(filename); assert.deepEqual(await files.importRows(filename),['same','same','last']);
+  await workbook.xlsx.writeFile(filename); assert.deepEqual((await files.importRows(filename)).map(row=>row.prompt),['same','same','last']);
   sheet.getCell('A3').value = { formula: 'HYPERLINK("https://example.com","x")', result: 'never evaluate' };
   await workbook.xlsx.writeFile(filename); await assert.rejects(files.importRows(filename),/包含公式/);
 });
@@ -83,7 +83,7 @@ test('failed URL download retries only download/save and keeps the staged id', a
 
 test('output symlinks and unsafe templates cannot escape selected folder', async () => {
   const {dir,files}=await fixture(); const output=path.join(dir,'out'), outside=path.join(dir,'outside'); await fs.mkdir(output); await fs.mkdir(outside); await files.registerOutputDirectory(output);
-  await fs.symlink(outside,path.join(output,'批量任务'),'dir'); const c=context(output), [image]=await files.stage([{bytes:await png()}],c);
+  await fs.symlink(outside,path.join(output,'批量任务'),process.platform === 'win32' ? 'junction' : 'dir'); const c=context(output), [image]=await files.stage([{bytes:await png()}],c);
   await assert.rejects(files.write(image,c),/不安全/);
   for (const naming of ['../x','{prompt}','a/b','a\\b','{序号}_{日期}.']) assert.throws(()=>validateNaming(naming));
   assert.equal(validateNaming('风景_{序号}_{日期}'),'风景_{序号}_{日期}');

@@ -1,7 +1,8 @@
 import { Readable } from 'node:stream';
 import { Agent, FormData as UndiciFormData, request as undiciRequest, type Dispatcher } from 'undici';
-import { BUILTIN_MODELS, type GenerationParams, type ModelInfo } from '../shared/types';
+import { BUILTIN_MODELS, type GenerationParams, type ModelInfo, type QuotaInfo } from '../shared/types';
 import { IMAGE_RATIO_PRESETS } from '../shared/image-presets';
+import { parseSub2APIQuota } from './quota';
 
 export interface ProviderImage { bytes?: Uint8Array; url?: string; mime?: string }
 export interface ProviderReference { name: string; mime: string; data: Uint8Array }
@@ -28,7 +29,7 @@ const SIZES = IMAGE_RATIO_PRESETS.map(preset => preset.size);
 const QUALITIES = ['auto', 'low', 'medium', 'high'];
 
 export type ProviderErrorCode = 'VALIDATION' | 'TEXT_MODEL_REQUIRED' | 'CANCELLED' | 'TIMEOUT' |
-  'NETWORK' | 'HTTP' | 'REDIRECT' | 'INVALID_RESPONSE' | 'RESPONSE_TOO_LARGE' | 'PARTIAL_RESULT' | 'REFERENCE_MISMATCH';
+  'NETWORK' | 'HTTP' | 'REDIRECT' | 'INVALID_RESPONSE' | 'RESPONSE_TOO_LARGE' | 'PARTIAL_RESULT' | 'REFERENCE_MISMATCH' | 'QUOTA_UNAVAILABLE';
 const ERROR_MESSAGES: Record<ProviderErrorCode, string> = {
   VALIDATION: '请求参数无效，请检查供应商、模型、尺寸、质量、数量和参考图。',
   TEXT_MODEL_REQUIRED: '提示词优化和翻译暂不可用：尚未配置文本模型。',
@@ -41,6 +42,7 @@ const ERROR_MESSAGES: Record<ProviderErrorCode, string> = {
   RESPONSE_TOO_LARGE: '供应商返回的数据超过安全大小限制，已停止接收。',
   PARTIAL_RESULT: '供应商仅返回部分有效图片；已保留有效结果，请勿自动补生。',
   REFERENCE_MISMATCH: '优化或翻译结果改变了参考图引用标记，已拒绝替换并保留原提示词。',
+  QUOTA_UNAVAILABLE: '上游未返回可识别的额度信息，请在供应商控制台查看。',
 };
 export class ProviderError extends Error {
   readonly code: ProviderErrorCode;
@@ -226,16 +228,26 @@ export class ImageProvider {
             responseHeaders.append(name, entry);
           }
         }
-        const stream = Readable.toWeb(response.body) as ReadableStream<Uint8Array>;
-        if ([204, 205, 304].includes(response.statusCode)) {
-          void stream.cancel().catch(() => undefined);
+        // Error bodies are never exposed. Dispose them before adapting streams:
+        // cancelling Node's Web-stream adapter can race a late close event.
+        if (response.statusCode >= 300 || [204, 205].includes(response.statusCode)) {
+          response.body.on('error', () => undefined);
+          response.body.destroy();
           return new Response(null, { status: response.statusCode, headers: responseHeaders });
         }
+        const stream = Readable.toWeb(response.body) as ReadableStream<Uint8Array>;
         return new Response(stream, { status: response.statusCode, headers: responseHeaders });
       }) as typeof globalThis.fetch;
     }
   }
   async close(): Promise<void> { await this.agent?.close(); }
+
+  async quota(input: ProviderCredentials): Promise<QuotaInfo> {
+    const response = await this.request(input, 'usage', 'GET', undefined, Math.min(this.timeouts.modelsMs, 15_000), MAX_METADATA_BYTES, Math.min(this.timeouts.bodyMs, 15_000));
+    const quota = parseSub2APIQuota(response, this.now());
+    if (!quota) throw new ProviderError('QUOTA_UNAVAILABLE', { outcome: 'rejected' });
+    return quota;
+  }
 
   async models(input: ProviderCredentials): Promise<ModelInfo[]> {
     const started = this.now();
@@ -343,7 +355,7 @@ export class ImageProvider {
     return new ProviderError(code, { elapsed: this.now() - started, outcome: submitted ? 'unknown' : 'rejected' });
   }
   private async request(input: ProviderCredentials, path: string, method: 'GET' | 'POST', body: string | FormData | undefined,
-    headersMs: number, maxBytes: number): Promise<unknown> {
+    headersMs: number, maxBytes: number, bodyMs = this.timeouts.bodyMs): Promise<unknown> {
     const started = this.now();
     const url = endpoint(input.baseURL, path);
     const key = validatedKey(input.key);
@@ -361,7 +373,7 @@ export class ImageProvider {
           ...(typeof body === 'string' ? { 'Content-Type': 'application/json' } : {}) },
       }), controller.signal);
       clearTimeout(timer);
-      timer = setTimeout(() => { timedOut = true; controller.abort(); }, this.timeouts.bodyMs);
+      timer = setTimeout(() => { timedOut = true; controller.abort(); }, bodyMs);
       if (response.status >= 300 && response.status < 400) {
         void response.body?.cancel().catch(() => undefined);
         throw this.error('REDIRECT', started, submitted);

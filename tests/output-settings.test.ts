@@ -24,15 +24,16 @@ test('new submissions use saved output settings while queued jobs keep their sna
   await engine.execute('saveProvider', { id: 'builtin', name: 'Test', baseURL: BUILTIN_URL, key: 'local-test-key', enabledModels: [...BUILTIN_MODELS] });
   await engine.execute('createTask', { kind: 'batch' });
   const first = engine.getState().tasks[0].id;
-  await engine.setRows(first, ['one']);
-  await engine.execute('updateTask', { id: first, outputDirectory: 'C:\\legacy', naming: 'legacy_{序号}' });
+  await engine.setRows(first, ['one', 'second']);
+  await engine.execute('updateTask', { id: first, outputDirectory: 'C:\\legacy', naming: 'legacy_{序号}', params: { count: 4 } });
   await assert.rejects(engine.execute('saveSettings', { naming: '../invalid' }), /命名规则/);
   await assert.rejects(engine.execute('saveSettings', { naming: 'bad.' }), /命名规则/);
-  await engine.execute('saveSettings', { outputDirectory: 'C:\\first', naming: '图_{序号}' });
+  await assert.rejects(engine.execute('saveSettings', { namingMode: 'custom' }), /文件命名方式/);
+  await engine.execute('saveSettings', { outputDirectory: 'C:\\first', naming: '图_{序号}', outputLayout: 'flat' });
   engine.stop();
   await engine.execute('submitTask', { id: first });
   const firstJob = engine.getState().tasks[0].jobs[0].id;
-  await engine.execute('saveSettings', { outputDirectory: 'C:\\second', naming: '新_{日期}' });
+  await engine.execute('saveSettings', { outputDirectory: 'C:\\second', namingMode: 'date-sequence', outputLayout: 'grouped' });
   await engine.execute('createTask', { kind: 'batch' });
   const second = engine.getState().tasks[1].id;
   await engine.setRows(second, ['two']);
@@ -40,12 +41,18 @@ test('new submissions use saved output settings while queued jobs keep their sna
   const secondJob = engine.getState().tasks[1].jobs[0].id;
   const snapshot = (await store.load())!;
   assert.equal(snapshot.jobs[firstJob].context.outputDirectory, 'C:\\first');
-  assert.equal(snapshot.jobs[firstJob].context.naming, '图_{序号}');
+  assert.equal(snapshot.jobs[firstJob].context.naming, '{日期}_{序号}');
+  assert.equal(snapshot.jobs[firstJob].context.namingMode, 'date-sequence');
+  assert.equal(snapshot.jobs[firstJob].context.outputLayout, 'flat');
+  assert.equal(snapshot.jobs[engine.getState().tasks[0].jobs[1].id].context.sequence, 5);
   assert.equal(snapshot.jobs[secondJob].context.outputDirectory, 'C:\\second');
-  assert.equal(snapshot.jobs[secondJob].context.naming, '新_{日期}');
+  assert.equal(snapshot.jobs[secondJob].context.naming, '{日期}_{序号}');
+  assert.equal(snapshot.jobs[secondJob].context.namingMode, 'date-sequence');
+  assert.equal(snapshot.jobs[secondJob].context.outputLayout, 'grouped');
+  assert.equal(snapshot.jobs[secondJob].context.sequence, 1);
 });
 
-test('existing batch naming is migrated into settings without discarding task data', async () => {
+test('legacy custom settings migrate to a preset without discarding task data', async () => {
   const store = new MemoryStore(), credentials = new Vault(), first = makeEngine(store, credentials);
   await first.init();
   await first.execute('createTask', { kind: 'batch' });
@@ -54,10 +61,12 @@ test('existing batch naming is migrated into settings without discarding task da
   first.stop();
   const previous = (await store.load())!;
   delete previous.state.settings.naming;
+  previous.state.settings.namingMode = 'custom';
   await store.save(previous);
   const restarted = makeEngine(store, credentials);
   await restarted.init();
-  assert.equal(restarted.getState().settings.naming, '旧_{序号}');
+  assert.equal(restarted.getState().settings.naming, '{日期}_{序号}');
+  assert.equal(restarted.getState().settings.namingMode, 'date-sequence');
   assert.equal(restarted.getState().tasks[0].naming, '旧_{序号}');
   restarted.stop();
 });

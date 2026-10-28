@@ -58,3 +58,24 @@ test('queued tasks cannot be deleted', async () => {
   assert.equal(engine.getState().tasks.length, 1);
   engine.stop();
 });
+
+test('batch task names persist and deleting retains imported rows and references', async () => {
+  const store = new MemoryStore();
+  const engine = makeEngine(store);
+  await engine.init();
+  await engine.execute('createTask', { kind: 'batch' });
+  const id = engine.getState().tasks[0].id;
+  const reference = { id: 'reference-1', name: '参考.png', url: 'qingtu-asset://reference-1' };
+  await engine.setRows(id, ['修改图片风格'], [reference]);
+  await engine.execute('renameTask', { id, title: '批量风格调整' });
+  assert.equal(engine.getState().tasks[0].customTitle, '批量风格调整');
+  await engine.execute('deleteTask', { id });
+  assert.equal(engine.getState().tasks.length, 0);
+  const saved = (await store.load())!;
+  assert.equal(saved.state.tasks[0].archived, true);
+  assert.equal(saved.state.tasks[0].customTitle, '批量风格调整');
+  assert.deepEqual(saved.state.tasks[0].rows, ['修改图片风格']);
+  assert.deepEqual(saved.state.tasks[0].rowReferenceIds, ['reference-1']);
+  assert.equal(saved.state.references[0].id, reference.id);
+  engine.stop();
+});

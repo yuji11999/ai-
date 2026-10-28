@@ -7,8 +7,8 @@ export function findWorkspaceDraft(tasks: Task[], kind: TaskKind): Task | undefi
 }
 
 /** Single-image drafts appear in the history only after their first submission. */
-export function visibleWorkspaceTasks(tasks: Task[], kind: TaskKind, selected?: string): Task[] {
-  return tasks.filter(task => task.kind === kind && (kind === 'single' ? task.jobs.length > 0 : task.id !== selected || task.jobs.length > 0))
+export function visibleWorkspaceTasks(tasks: Task[], kind: TaskKind): Task[] {
+  return tasks.filter(task => task.kind === kind && (kind === 'batch' || task.jobs.length > 0))
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
